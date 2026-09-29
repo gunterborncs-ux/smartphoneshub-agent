@@ -15,10 +15,10 @@ CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@smartphoneshub")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
-# Модели с гарантированной поддержкой JSON-режима (response_format)
-# Primary: OpenAI GPT-OSS 20B — проверенный "clean JSON output"
-PRIMARY_MODEL = "openai/gpt-oss-20b:free"
-# Fallback: NVIDIA Nemotron 3 Super — 120B MoE, 262K контекст, JSON
+# Модели с гарантированной поддержкой структурированного вывода (JSON schema)
+# Primary: Cohere North Mini Code — 30B MoE, 256K контекст, JSON schema
+PRIMARY_MODEL = "cohere/north-mini-code:free"
+# Fallback: NVIDIA Nemotron 3 Super — 120B MoE, 1M контекст, schema
 FALLBACK_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 # --- Агент ---
