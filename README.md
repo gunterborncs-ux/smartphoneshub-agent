@@ -1,4 +1,4 @@
-# 📱 Smartphones News Agent
+# 📱 Smartphones News Agent 
 
 ИИ-агент для автоматического мониторинга мировых СМИ о смартфонах
 и публикации новостей в Telegram-канал [@smartphoneshub](https://t.me/smartphoneshub).
