@@ -32,6 +32,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
+# --- Маркеры «утечки» reasoning-модели (страховка) ---
+_LEAK_MARKERS = (
+    "thinking process",
+    "chain of thought",
+    "analyze user input",
+    "analyze the request",
+    "here's a",
+    "let me think",
+    "мысленный процесс",
+    "размышляю",
+)
+
 
 async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
     """Асинхронно забирает и парсит одну RSS-ленту."""
@@ -72,10 +84,7 @@ async def collect_all_news() -> list[dict]:
 
 
 async def publish_posts(bot: Bot, posts: list[str]) -> list[str]:
-    """
-    Публикует посты в Telegram-канал.
-    :return: список успешно опубликованных постов
-    """
+    """Публикует посты в Telegram-канал."""
     published: list[str] = []
     for post in posts:
         try:
@@ -97,14 +106,17 @@ async def run_cycle() -> None:
     """Один полный цикл агента."""
     logger.info("=== Старт цикла ===")
 
-    # 1. Сбор новостей
-    articles = await collect_all_news()
+    # --- 1. Сбор новостей ---
+    articles: list[dict] = await collect_all_news()
     if not articles:
         logger.info("Нет новых статей, выход.")
         return
 
-    # 2. Ограничение и загрузка истории
+    # --- 2. Ограничение по количеству ---
     articles = articles[:MAX_ARTICLES_PER_RUN]
+    logger.info("После ограничения по количеству: %d", len(articles))
+
+    # --- 3. Фильтр по истории опубликованного ---
     history = load_history(HISTORY_FILE)
     articles = filter_unpublished(articles, history)
     logger.info("После фильтра по истории: %d", len(articles))
@@ -113,47 +125,42 @@ async def run_cycle() -> None:
         logger.info("Все статьи уже были опубликованы ранее.")
         return
 
-    # 3. Дедупликация
+    # --- 4. Дедупликация ---
     articles = deduplicate(articles, threshold=SIMILARITY_THRESHOLD)
     logger.info("После дедупликации: %d", len(articles))
 
     if not articles:
+        logger.info("После дедупликации не осталось статей.")
         return
 
-    # 4. Суммаризация через OpenRouter
-    posts = await summarize_news(articles)
-    posts = posts[:MAX_POSTS_PER_RUN]
+    # --- 5. Суммаризация через OpenRouter ---
+    posts: list[str] = await summarize_news(articles)
     logger.info("Сгенерировано постов: %d", len(posts))
 
+    # --- 6. Страховка: отсекаем «утечки» reasoning-модели ---
+    clean_posts: list[str] = []
+    for post in posts:
+        low = post.lower()
+        if any(marker in low for marker in _LEAK_MARKERS):
+            logger.warning("Отброшен пост с утечкой reasoning: %s", post[:80])
+            continue
+        clean_posts.append(post)
+
+    posts = clean_posts[:MAX_POSTS_PER_RUN]
+    logger.info("Постов после финального фильтра: %d", len(posts))
+
     if not posts:
+        logger.info("Нет валидных постов для публикации.")
         return
-# main.py — в функции run_cycle() перед публикацией
 
-async def run_cycle() -> None:
-    # ... сбор, дедуп, суммаризация ...
-
-    posts = await summarize_news(articles)
-
-    # Финальная страховка: отсекаем посты-«утечки»
-    posts = [
-        p for p in posts
-        if not any(marker in p.lower() for marker in (
-            "thinking process", "chain of thought", "analyze user input",
-            "here's a", "let me think", "analyze the request",
-        ))
-    ]
-
-    posts = posts[:MAX_POSTS_PER_RUN]
-    # ... публикация ...
-    
-    # 5. Публикация
+    # --- 7. Публикация ---
     bot = Bot(token=BOT_TOKEN)
     try:
         await publish_posts(bot, posts)
     finally:
         await bot.session.close()
 
-    # 6. Сохранение истории (все собранные URL, чтобы не собирать их снова)
+    # --- 8. Сохранение истории ---
     history.update(a["link"] for a in articles)
     save_history(HISTORY_FILE, history)
 
