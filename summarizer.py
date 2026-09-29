@@ -1,12 +1,10 @@
 """
 Суммаризация новостей через OpenRouter.
 
-Использует structured output (JSON schema) для гарантированного формата.
-Парсит ответ через json.loads(strict=False) + JSONDecoder.raw_decode —
-это устойчиво к control-символам (неэкранированные \n, \t, \r),
-которые часто встречаются в ответах LLM.
+Формат ответа — обычный текст с разделителем ===POST=== между постами.
+Никакого JSON: устойчиво к BOM, unpaired surrogates в эмодзи, Unicode-пробелам,
+неэкранированным control-символам и прочим «прелестям» LLM-вывода.
 """
-import json
 import logging
 import re
 
@@ -26,56 +24,70 @@ _client = AsyncOpenAI(
     api_key=OPENROUTER_KEY,
 )
 
-SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphoneshub о смартфонах и мобильных технологиях.
+SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphoneshub о смартфонах.
 
-Твоя задача — из предоставленного списка новостей создать от 3 до 5 отдельных постов.
+Создай от 3 до 5 постов из новостей ниже.
 
 Требования к каждому посту:
-- Эмодзи в начале (📱, 🔥, 💡, 📸, ⚡, 🚀, 🎧, 📺 и т.п.)
-- Заголовок на русском языке (до 80 символов)
-- Краткое описание в 2–3 предложениях: только факты, цифры, названия моделей
-- В конце — ссылка в формате <a href="URL">Источник</a>
-- Длина поста — до 600 символов
-- Тон: информативный, нейтральный, без кликбейта
-- Все новости переводи на русский язык
+- Эмодзи в начале (📱, 🔥, 💡, 📸, ⚡, 🚀, 🎧, 📺)
+- Заголовок на русском (до 80 символов)
+- 2–3 предложения: факты, цифры, названия моделей
+- В конце — ссылка точно в формате <a href="URL">Источник</a>
+- Длина — до 600 символов
+- Тон: информативный, нейтральный
+- Всё на русском языке
 
-ФОРМАТ ОТВЕТА — строго JSON-объект вида:
-{"posts": [{"text": "полный текст поста 1"}, {"text": "полный текст поста 2"}]}
+ФОРМАТ ОТВЕТА:
 
-ЗАПРЕЩЕНО:
-- Добавлять размышления, chain-of-thought, анализ, "Here's a thinking process"
-- Писать что-либо на английском языке
-- Использовать markdown-обёртки ```json
-- Добавлять комментарии до или после JSON
+===POST===
+
+📱 Заголовок первого поста
+Текст первого поста с фактами.
+<a href="https://example.com/1">Источник</a>
+
+===POST===
+
+🔥 Заголовок второго поста
+Текст второго поста.
+<a href="https://example.com/2">Источник</a>
+
+ПРАВИЛА:
+- Между постами — строго строка ===POST=== (три знака =, слово POST, три знака =)
+- НЕ используй JSON, markdown, нумерацию
+- НЕ добавляй пояснений до или после постов
+- Начни сразу с первого поста
+- URL в ссылке должен быть из исходных данных (не выдумывай)
 """
 
-# --- JSON Schema для structured output ---
-POSTS_SCHEMA = {
-    "name": "posts_response",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "posts": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"}
-                    },
-                    "required": ["text"],
-                    "additionalProperties": False
-                }
-            }
-        },
-        "required": ["posts"],
-        "additionalProperties": False
-    }
-}
+
+# ---------- Утилиты очистки ----------
+
+def _clean_unicode(text: str) -> str:
+    """
+    Нормализует строку:
+    - собирает surrogate pairs в code points (📱 и т.п.)
+    - удаляет lone surrogates, BOM, zero-width символы
+    - заменяет нестандартные Unicode-пробелы на обычные
+    """
+    if not text:
+        return text
+
+    # Surrogate pairs → нормальные code points
+    try:
+        text = text.encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+
+    # Удаляем BOM, zero-width, line/paragraph separators
+    text = re.sub(r"[\u200b-\u200f\ufeff\u2028\u2029]", "", text)
+    # Нестандартные пробелы → обычный пробел
+    text = re.sub(r"[\u00a0\u2000-\u200a\u202f\u205f\u3000]", " ", text)
+
+    return text
 
 
 def _strip_thinking(text: str) -> str:
-    """Убирает возможные блоки размышлений модели."""
+    """Убирает блоки размышлений, если модель их всё-таки вывела."""
     patterns = [
         re.compile(r"[\s\S]*?", re.IGNORECASE),
         re.compile(r"<thinking>[\s\S]*?</thinking>", re.IGNORECASE),
@@ -86,45 +98,27 @@ def _strip_thinking(text: str) -> str:
     return text.strip()
 
 
-def _extract_json(text: str) -> dict | None:
-    """
-    Извлекает JSON-объект из ответа модели.
+def _clean_post(text: str) -> str:
+    """Убирает служебные обёртки вокруг одного поста."""
+    text = text.strip()
 
-    Три стратегии:
-    1. json.loads с strict=False — терпит неэкранированные control-символы.
-    2. raw_decode — парсит первый валидный JSON и игнорирует хвост.
-    3. Поиск { ... } в тексте — на случай преамбулы до JSON.
-    """
-    text = _strip_thinking(text)
-    if not text:
-        return None
+    # Markdown-обёртки
+    text = re.sub(r"^```[\w]*\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
 
-    # Стратегия 1: прямой парсинг с strict=False
-    try:
-        return json.loads(text, strict=False)
-    except json.JSONDecodeError:
-        pass
+    # JSON-остатки: "text": "..." или {"text": "..."
+    text = re.sub(r'^\s*["\']?text["\']?\s*:\s*["\']?', "", text)
+    text = re.sub(r'^\s*[\{\[]\s*["\']?text["\']?\s*:\s*["\']?', "", text)
 
-    # Стратегия 2: raw_decode — парсит первый объект и игнорирует остаток
-    try:
-        decoder = json.JSONDecoder(strict=False)
-        obj, _ = decoder.raw_decode(text)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
+    # Ведущие и хвостовые кавычки/скобки/запятые
+    text = re.sub(r'^[\s"\'`\[\{\},:]+', "", text)
+    text = re.sub(r'[\s"\'`\[\{\},:]+$', "", text)
 
-    # Стратегия 3: ищем {...} внутри текста (если была преамбула)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return json.loads(text[start:end + 1], strict=False)
-        except json.JSONDecodeError as exc:
-            logger.error("JSONDecodeError (fragment %d..%d): %s", start, end, exc)
-            return None
+    # Схлопываем множественные пробелы
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
-    return None
+    return text.strip()
 
 
 def _is_emoji(ch: str) -> bool:
@@ -152,11 +146,91 @@ def _is_valid_post(text: str, max_len: int = 600) -> bool:
     return True
 
 
+# ---------- Разбор ответа на посты ----------
+
+_DELIMITERS = [
+    re.compile(r"===+\s*POST\s*===+", re.IGNORECASE),
+    re.compile(r"---+\s*POST\s*---+", re.IGNORECASE),
+    re.compile(r"---+\s*ПОСТ\s*---+", re.IGNORECASE),
+    re.compile(r"\n\s*===+\s*\n"),
+    re.compile(r"\n\s*---+\s*\n"),
+]
+
+_ANCHOR_RE = re.compile(r'<a\s+href="[^"]+"\s*>\s*Источник\s*</a>')
+
+
+def _split_by_delimiter(raw: str) -> list[str] | None:
+    """Пробует разбить текст по одному из разделителей."""
+    for delim in _DELIMITERS:
+        parts = delim.split(raw)
+        if len(parts) >= 2:  # хотя бы один разделитель найден
+            logger.info("Сработал разделитель: %s (частей: %d)",
+                        delim.pattern, len(parts))
+            return parts
+    return None
+
+
+def _split_by_anchors(raw: str) -> list[str]:
+    """
+    Fallback: разбивает текст по ссылкам <a href="...">Источник</a>.
+    Каждый пост заканчивается такой ссылкой.
+    """
+    parts = _ANCHOR_RE.split(raw)
+    posts: list[str] = []
+    buffer = ""
+
+    for i, part in enumerate(parts):
+        if _ANCHOR_RE.fullmatch(part.strip()):
+            buffer += part
+            posts.append(buffer)
+            buffer = ""
+        else:
+            buffer += part
+
+    # Хвост без якоря — не пост, игнорируем
+    return posts
+
+
+def _parse_posts(raw: str) -> list[str]:
+    """Полный конвейер: очистка → разбиение → валидация."""
+    if not raw:
+        return []
+
+    raw = _clean_unicode(raw)
+    logger.info("После _clean_unicode: %d символов", len(raw))
+    logger.info("Первые 200 символов (repr): %r", raw[:200])
+
+    raw = _strip_thinking(raw)
+    if not raw:
+        logger.error("После _strip_thinking текст пуст")
+        return []
+
+    parts = _split_by_delimiter(raw)
+    if parts is None:
+        logger.warning("Разделители не найдены — пробую anchor-fallback")
+        parts = _split_by_anchors(raw)
+        if not parts:
+            logger.warning("Anchor-fallback не нашёл ни одного поста")
+            return []
+
+    posts: list[str] = []
+    for i, part in enumerate(parts):
+        cleaned = _clean_post(part)
+        if _is_valid_post(cleaned):
+            posts.append(cleaned)
+        elif cleaned:
+            logger.warning(
+                "Пост #%d отклонён. Первые 120 символов: %r",
+                i, cleaned[:120],
+            )
+
+    return posts
+
+
+# ---------- Публичный API ----------
+
 async def summarize_news(articles: list[dict]) -> list[str]:
-    """
-    Превращает сырые новости в готовые посты для Telegram.
-    Возвращает только валидные посты.
-    """
+    """Превращает новости в готовые посты через OpenRouter."""
     if not articles:
         return []
 
@@ -178,49 +252,15 @@ async def summarize_news(articles: list[dict]) -> list[str]:
                 ],
                 temperature=0.5,
                 max_tokens=2500,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": POSTS_SCHEMA
-                },
             )
 
             raw = response.choices[0].message.content or ""
-            # Логируем ПОЛНЫЙ ответ, чтобы при сбое видеть реальный JSON
             logger.info("Сырой ответ (%d символов):\n%s", len(raw), raw)
 
-            data = _extract_json(raw)
-            if not data:
-                logger.warning("Модель %s: не удалось распарсить JSON", model)
-                continue
-
-            if "posts" not in data:
-                logger.warning(
-                    "Модель %s: нет поля 'posts'. Ключи: %s",
-                    model, list(data.keys()),
-                )
-                continue
-
-            posts_raw = data["posts"]
-            if not isinstance(posts_raw, list):
-                logger.warning("Модель %s: 'posts' не список, а %s",
-                               model, type(posts_raw).__name__)
-                continue
-
-            valid_posts: list[str] = []
-            for item in posts_raw:
-                text = item.get("text", "") if isinstance(item, dict) else str(item)
-                text = text.strip()
-                if _is_valid_post(text):
-                    valid_posts.append(text)
-                else:
-                    logger.warning("Отклонён пост: %s...", text[:80])
-
-            if valid_posts:
-                logger.info(
-                    "Модель %s: валидных постов %d из %d",
-                    model, len(valid_posts), len(posts_raw),
-                )
-                return valid_posts
+            posts = _parse_posts(raw)
+            if posts:
+                logger.info("Модель %s: валидных постов %d", model, len(posts))
+                return posts
 
             logger.warning("Модель %s: ни один пост не прошёл валидацию", model)
 
