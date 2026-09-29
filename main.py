@@ -4,7 +4,7 @@ Smartphones News Agent — точка входа.
 Запускается по расписанию GitHub Actions, выполняет один цикл:
 сбор RSS → фильтрация → дедупликация → суммаризация → публикация → сохранение истории.
 
-При отсутствии постов для публикации отправляет уведомление админу в личку.
+Тематика: только смартфоны, ожидаемые новинки, прототипы.
 """
 import asyncio
 import logging
@@ -26,7 +26,12 @@ from config import (
     POST_DELAY_SECONDS,
 )
 from dedup import deduplicate
-from rss_sources import RSS_FEEDS, BRAND_MARKERS, PHONE_KEYWORDS, STOP_WORDS
+from rss_sources import (
+    RSS_FEEDS,
+    BRAND_MARKERS,
+    PHONE_KEYWORDS,
+    STOP_WORDS,
+)
 from storage import load_history, save_history, filter_unpublished
 from summarizer import summarize_news
 
@@ -129,6 +134,18 @@ def is_relevant(article: dict) -> bool:
         return True
 
     return False
+
+
+async def collect_all_news() -> list[dict]:
+    """Параллельно собирает все RSS-ленты и фильтрует релевантные."""
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_rss(session, url) for url in RSS_FEEDS]
+        results = await asyncio.gather(*tasks)
+
+    all_articles = [a for feed in results for a in feed]
+    relevant = [a for a in all_articles if is_relevant(a)]
+    logger.info("Собрано статей: %d, релевантных: %d", len(all_articles), len(relevant))
+    return relevant
 
 
 # ---------- Публикация ----------
@@ -238,8 +255,7 @@ async def run_cycle() -> None:
                 "🚨 <b>LLM не сгенерировала ни одного валидного поста</b>",
                 f"Статей на входе: {len(articles)}. "
                 f"Проверь логи GitHub Actions — вероятно, обе модели вернули "
-                f"некорректный формат или упали с ошибкой. "
-                f"Возможна смена бесплатных моделей на OpenRouter.",
+                f"некорректный формат или упали с ошибкой.",
             )
             return
 
