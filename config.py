@@ -15,10 +15,10 @@ CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@smartphoneshub")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
-# Primary: Cohere North Mini Code — 256K контекст, отработал в логах
-PRIMARY_MODEL = "cohere/north-mini-code:free"
-# Fallback: NVIDIA Nemotron 3 Super
-FALLBACK_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+# Primary: NVIDIA Nemotron 3 Super — отрабатывает быстрее
+PRIMARY_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+# Fallback: Cohere North Mini Code
+FALLBACK_MODEL = "cohere/north-mini-code:free"
 
 # --- Агент ---
 MAX_ARTICLES_PER_RUN = 30          # максимум статей на цикл
