@@ -1,0 +1,47 @@
+name: Smartphones News Agent
+
+on:
+  schedule:
+    # 4 раза в день (UTC): 6:00, 10:00, 14:00, 18:00
+    - cron: '0 6,10,14,18 * * *'
+  # Ручной запуск для тестирования
+  workflow_dispatch:
+
+# Права на запись в репозиторий (для коммита истории)
+permissions:
+  contents: write
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run agent
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python main.py
+
+      - name: Commit published history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add published.json
+          git diff --staged --quiet || git commit -m "chore: update published history [skip ci]"
+          git push
