@@ -6,6 +6,7 @@ Smartphones News Agent — точка входа.
 """
 import asyncio
 import logging
+import re
 
 import aiohttp
 import feedparser
@@ -43,6 +44,9 @@ _LEAK_MARKERS = (
     "мысленный процесс",
     "размышляю",
 )
+
+# --- Извлечение URL из HTML-ссылки в посте ---
+_URL_RE = re.compile(r'<a\s+href="([^"]+)"')
 
 
 async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
@@ -102,6 +106,15 @@ async def publish_posts(bot: Bot, posts: list[str]) -> list[str]:
     return published
 
 
+def extract_urls(posts: list[str]) -> set[str]:
+    """Извлекает URL источников из опубликованных постов."""
+    urls: set[str] = set()
+    for post in posts:
+        for match in _URL_RE.findall(post):
+            urls.add(match)
+    return urls
+
+
 async def run_cycle() -> None:
     """Один полный цикл агента."""
     logger.info("=== Старт цикла ===")
@@ -150,18 +163,26 @@ async def run_cycle() -> None:
     logger.info("Постов после финального фильтра: %d", len(posts))
 
     if not posts:
-        logger.info("Нет валидных постов для публикации.")
+        logger.info("Нет валидных постов для публикации. История НЕ обновляется.")
         return
 
     # --- 7. Публикация ---
     bot = Bot(token=BOT_TOKEN)
     try:
-        await publish_posts(bot, posts)
+        published = await publish_posts(bot, posts)
     finally:
         await bot.session.close()
 
+    if not published:
+        logger.warning("Ни один пост не опубликован — история не обновляется.")
+        return
+
     # --- 8. Сохранение истории ---
-    history.update(a["link"] for a in articles)
+    # Сохраняем ТОЛЬКО URL из реально опубликованных постов.
+    # Это позволяет переработать «отброшенные» статьи в следующих циклах.
+    new_urls = extract_urls(published)
+    logger.info("Новых URL для истории: %d", len(new_urls))
+    history.update(new_urls)
     save_history(HISTORY_FILE, history)
 
     logger.info("=== Цикл завершён ===")
