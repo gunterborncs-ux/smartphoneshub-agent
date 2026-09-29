@@ -24,6 +24,7 @@ from config import (
     SIMILARITY_THRESHOLD,
     HISTORY_FILE,
     POST_DELAY_SECONDS,
+    HISTORY_RETENTION_DAYS,
 )
 from dedup import deduplicate
 from rss_sources import (
@@ -32,7 +33,13 @@ from rss_sources import (
     PHONE_KEYWORDS,
     STOP_WORDS,
 )
-from storage import load_history, save_history, filter_unpublished
+from storage import (
+    load_history,
+    save_history,
+    filter_unpublished,
+    cleanup_old,
+    add_urls,
+)
 from summarizer import summarize_news
 
 # --- Логирование ---
@@ -275,7 +282,15 @@ async def run_cycle() -> None:
         # --- 8. Сохранение истории ---
         new_urls = extract_urls(published)
         logger.info("Новых URL для истории: %d", len(new_urls))
-        history.update(new_urls)
+
+        # Добавляем новые URL с текущим таймстампом
+        add_urls(history, new_urls)
+        logger.info("История до очистки: %d записей", len(history))
+
+        # Удаляем записи старше N дней
+        history = cleanup_old(history, days=HISTORY_RETENTION_DAYS)
+        logger.info("История после очистки: %d записей", len(history))
+
         save_history(HISTORY_FILE, history)
 
         logger.info("=== Цикл завершён: опубликовано %d постов ===", len(published))
