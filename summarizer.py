@@ -1,12 +1,13 @@
 """
 Суммаризация новостей через OpenRouter.
 
-Использует JSON structured output для гарантированного формата
-и жёсткую валидацию каждого поста перед возвратом.
+Использует JSON structured output (response_format={"type": "json_object"})
+для гарантированного формата ответа. Валидирует каждый пост перед возвратом.
 """
 import json
 import logging
 import re
+
 from openai import AsyncOpenAI
 
 from config import (
@@ -23,9 +24,9 @@ _client = AsyncOpenAI(
     api_key=OPENROUTER_KEY,
 )
 
-SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphoneshub о смартфонах.
+SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphoneshub о смартфонах и мобильных технологиях.
 
-Твоя задача — из списка новостей создать от 3 до 5 отдельных постов.
+Твоя задача — из предоставленного списка новостей создать от 3 до 5 отдельных постов.
 
 Требования к каждому посту:
 - Эмодзи в начале (📱, 🔥, 💡, 📸, ⚡, 🚀, 🎧, 📺 и т.п.)
@@ -46,20 +47,15 @@ SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphonesh
 - Добавлять комментарии до или после JSON
 - Использовать какой-либо разделитель вместо JSON
 
-Если нужно «подумать» — делай это во внутреннем скрытом канале,
-в финальном ответе оставь только чистый JSON.
-"""
+В финальном ответе — только чистый JSON."""
 
-# --- Регулярки для очистки возможных «утечек» ---
 
+# --- Регулярки для очистки возможных «утечек» reasoning ---
 _THINKING_PATTERNS = [
     re.compile(r"[\s\S]*?", re.IGNORECASE),
     re.compile(r"<thinking>[\s\S]*?</thinking>", re.IGNORECASE),
     re.compile(r"<reasoning>[\s\S]*?</reasoning>", re.IGNORECASE),
 ]
-
-# Предисловия вроде "Here's a thinking process:" до первого {
-_PREAMBLE_RE = re.compile(r"^[\s\S]*?(?=\{)", re.MULTILINE)
 
 
 def _strip_thinking(text: str) -> str:
@@ -72,17 +68,15 @@ def _strip_thinking(text: str) -> str:
 def _extract_json(text: str) -> dict | None:
     """
     Извлекает JSON-объект из ответа модели.
-    Пытается найти первую { и последнюю } и распарсить.
+    Сначала пробует прямой парсинг, затем — поиск { ... } внутри текста.
     """
     text = _strip_thinking(text)
 
-    # Прямая попытка
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Поиск JSON-объекта внутри текста
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -115,7 +109,6 @@ def _is_valid_post(text: str, max_len: int = 600) -> bool:
         return False
     if "<a href=" not in stripped:
         return False
-    # Хотя бы одно слово на кириллице
     if not re.search(r"[А-Яа-яЁё]", stripped):
         return False
     return True
@@ -151,11 +144,11 @@ async def summarize_news(articles: list[dict]) -> list[str]:
             )
 
             raw = response.choices[0].message.content or ""
-            logger.debug("Сырой ответ модели (%d символов):\n%s", len(raw), raw[:1000])
+            logger.debug("Сырой ответ (%d символов): %s", len(raw), raw[:500])
 
             data = _extract_json(raw)
             if not data or "posts" not in data:
-                logger.warning("Модель %s: нет поля 'posts' в ответе", model)
+                logger.warning("Модель %s: нет поля 'posts'", model)
                 continue
 
             posts_raw = data["posts"]
@@ -170,10 +163,7 @@ async def summarize_news(articles: list[dict]) -> list[str]:
                 if _is_valid_post(text):
                     valid_posts.append(text)
                 else:
-                    logger.warning(
-                        "Отклонён невалидный пост (первые 100 символов): %s",
-                        text[:100],
-                    )
+                    logger.warning("Отклонён пост: %s...", text[:80])
 
             if valid_posts:
                 logger.info(
@@ -184,9 +174,10 @@ async def summarize_news(articles: list[dict]) -> list[str]:
 
             logger.warning("Модель %s: ни один пост не прошёл валидацию", model)
 
+        except json.JSONDecodeError as exc:
+            logger.error("Модель %s вернула не JSON: %s", model, exc)
         except Exception as exc:
             logger.error("Ошибка модели %s: %s", model, exc, exc_info=True)
-            continue
 
     logger.error("Все модели недоступны, посты не сгенерированы")
     return []
