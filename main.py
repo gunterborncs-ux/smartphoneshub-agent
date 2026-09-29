@@ -26,7 +26,7 @@ from config import (
     POST_DELAY_SECONDS,
 )
 from dedup import deduplicate
-from rss_sources import RSS_FEEDS, RELEVANCE_KEYWORDS
+from rss_sources import RSS_FEEDS, BRAND_MARKERS, PHONE_KEYWORDS, STOP_WORDS
 from storage import load_history, save_history, filter_unpublished
 from summarizer import summarize_news
 
@@ -103,21 +103,32 @@ async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
 
 
 def is_relevant(article: dict) -> bool:
-    """Проверяет, относится ли статья к мобильной тематике."""
-    text = (article.get("title", "") + " " + article.get("summary", "")).lower()
-    return any(kw.lower() in text for kw in RELEVANCE_KEYWORDS)
+    """
+    Проверяет, относится ли статья к смартфонам/ожидаемым новинкам/прототипам.
 
+    Логика:
+    - Есть хотя бы один стоп-ворд → отклонить.
+    - Есть маркер бренда смартфонов → принять.
+    - Либо есть >= 1 маркер из PHONE_KEYWORDS → принять.
+    - Иначе отклонить.
+    """
+    title = article.get("title", "").lower()
+    summary = article.get("summary", "").lower()
+    text = title + " " + summary
 
-async def collect_all_news() -> list[dict]:
-    """Параллельно собирает все RSS-ленты и фильтрует релевантные."""
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_rss(session, url) for url in RSS_FEEDS]
-        results = await asyncio.gather(*tasks)
+    # 1. Стоп-слова — жёсткое отклонение
+    if any(stop in text for stop in STOP_WORDS):
+        return False
 
-    all_articles = [a for feed in results for a in feed]
-    relevant = [a for a in all_articles if is_relevant(a)]
-    logger.info("Собрано статей: %d, релевантных: %d", len(all_articles), len(relevant))
-    return relevant
+    # 2. Маркеры брендов (Samsung, Xiaomi, ...)
+    if any(brand in text for brand in BRAND_MARKERS):
+        return True
+
+    # 3. Общие ключевые слова про смартфоны / утечки / прототипы
+    if any(kw in text for kw in PHONE_KEYWORDS):
+        return True
+
+    return False
 
 
 # ---------- Публикация ----------
