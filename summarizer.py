@@ -1,8 +1,8 @@
 """
 Суммаризация новостей через OpenRouter.
 
-Использует JSON structured output (response_format={"type": "json_object"})
-для гарантированного формата ответа. Валидирует каждый пост перед возвратом.
+Использует structured output (JSON schema) для гарантированного формата.
+Валидирует каждый пост перед возвратом.
 """
 import json
 import logging
@@ -45,22 +45,41 @@ SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphonesh
 - Писать что-либо на английском языке
 - Использовать markdown-обёртки ```json
 - Добавлять комментарии до или после JSON
-- Использовать какой-либо разделитель вместо JSON
+"""
 
-В финальном ответе — только чистый JSON."""
-
-
-# --- Регулярки для очистки возможных «утечек» reasoning ---
-_THINKING_PATTERNS = [
-    re.compile(r"[\s\S]*?", re.IGNORECASE),
-    re.compile(r"<thinking>[\s\S]*?</thinking>", re.IGNORECASE),
-    re.compile(r"<reasoning>[\s\S]*?</reasoning>", re.IGNORECASE),
-]
+# --- JSON Schema для structured output ---
+POSTS_SCHEMA = {
+    "name": "posts_response",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "posts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"}
+                    },
+                    "required": ["text"],
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["posts"],
+        "additionalProperties": False
+    }
+}
 
 
 def _strip_thinking(text: str) -> str:
-    """Убирает блоки размышлений модели из ответа."""
-    for pat in _THINKING_PATTERNS:
+    """Убирает возможные блоки размышлений модели."""
+    patterns = [
+        re.compile(r"[\s\S]*?", re.IGNORECASE),
+        re.compile(r"<thinking>[\s\S]*?</thinking>", re.IGNORECASE),
+        re.compile(r"<reasoning>[\s\S]*?</reasoning>", re.IGNORECASE),
+    ]
+    for pat in patterns:
         text = pat.sub("", text)
     return text.strip()
 
@@ -140,11 +159,14 @@ async def summarize_news(articles: list[dict]) -> list[str]:
                 ],
                 temperature=0.5,
                 max_tokens=2500,
-                response_format={"type": "json_object"},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": POSTS_SCHEMA
+                },
             )
 
             raw = response.choices[0].message.content or ""
-            logger.debug("Сырой ответ (%d символов): %s", len(raw), raw[:500])
+            logger.info("Сырой ответ (%d символов): %s", len(raw), raw[:300])
 
             data = _extract_json(raw)
             if not data or "posts" not in data:
