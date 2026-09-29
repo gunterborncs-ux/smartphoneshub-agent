@@ -1,9 +1,9 @@
 """
 Суммаризация новостей через OpenRouter.
 
-Формат ответа — обычный текст с разделителем ===POST=== между постами.
-Никакого JSON: устойчиво к BOM, unpaired surrogates в эмодзи, Unicode-пробелам,
-неэкранированным control-символам и прочим «прелестям» LLM-вывода.
+Формат ответа — обычный текст с разделителем ===POST===.
+Никакого JSON и никакой "очистки размышлений" — используем non-reasoning модели,
+которые отдают чистый текст сразу.
 """
 import logging
 import re
@@ -60,7 +60,7 @@ SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphonesh
 """
 
 
-# ---------- Утилиты очистки ----------
+# ---------- Утилиты ----------
 
 def _clean_unicode(text: str) -> str:
     """
@@ -72,30 +72,15 @@ def _clean_unicode(text: str) -> str:
     if not text:
         return text
 
-    # Surrogate pairs → нормальные code points
     try:
         text = text.encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
     except (UnicodeDecodeError, UnicodeEncodeError):
         text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
-    # Удаляем BOM, zero-width, line/paragraph separators
     text = re.sub(r"[\u200b-\u200f\ufeff\u2028\u2029]", "", text)
-    # Нестандартные пробелы → обычный пробел
     text = re.sub(r"[\u00a0\u2000-\u200a\u202f\u205f\u3000]", " ", text)
 
     return text
-
-
-def _strip_thinking(text: str) -> str:
-    """Убирает блоки размышлений, если модель их всё-таки вывела."""
-    patterns = [
-        re.compile(r"[\s\S]*?", re.IGNORECASE),
-        re.compile(r"<thinking>[\s\S]*?</thinking>", re.IGNORECASE),
-        re.compile(r"<reasoning>[\s\S]*?</reasoning>", re.IGNORECASE),
-    ]
-    for pat in patterns:
-        text = pat.sub("", text)
-    return text.strip()
 
 
 def _clean_post(text: str) -> str:
@@ -106,15 +91,7 @@ def _clean_post(text: str) -> str:
     text = re.sub(r"^```[\w]*\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
 
-    # JSON-остатки: "text": "..." или {"text": "..."
-    text = re.sub(r'^\s*["\']?text["\']?\s*:\s*["\']?', "", text)
-    text = re.sub(r'^\s*[\{\[]\s*["\']?text["\']?\s*:\s*["\']?', "", text)
-
-    # Ведущие и хвостовые кавычки/скобки/запятые
-    text = re.sub(r'^[\s"\'`\[\{\},:]+', "", text)
-    text = re.sub(r'[\s"\'`\[\{\},:]+$', "", text)
-
-    # Схлопываем множественные пробелы
+    # Схлопываем множественные пробелы/переводы строк
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
@@ -148,26 +125,8 @@ def _is_valid_post(text: str, max_len: int = 600) -> bool:
 
 # ---------- Разбор ответа на посты ----------
 
-_DELIMITERS = [
-    re.compile(r"===+\s*POST\s*===+", re.IGNORECASE),
-    re.compile(r"---+\s*POST\s*---+", re.IGNORECASE),
-    re.compile(r"---+\s*ПОСТ\s*---+", re.IGNORECASE),
-    re.compile(r"\n\s*===+\s*\n"),
-    re.compile(r"\n\s*---+\s*\n"),
-]
-
+_DELIMITER = re.compile(r"===+\s*POST\s*===+", re.IGNORECASE)
 _ANCHOR_RE = re.compile(r'<a\s+href="[^"]+"\s*>\s*Источник\s*</a>')
-
-
-def _split_by_delimiter(raw: str) -> list[str] | None:
-    """Пробует разбить текст по одному из разделителей."""
-    for delim in _DELIMITERS:
-        parts = delim.split(raw)
-        if len(parts) >= 2:  # хотя бы один разделитель найден
-            logger.info("Сработал разделитель: %s (частей: %d)",
-                        delim.pattern, len(parts))
-            return parts
-    return None
 
 
 def _split_by_anchors(raw: str) -> list[str]:
@@ -179,7 +138,7 @@ def _split_by_anchors(raw: str) -> list[str]:
     posts: list[str] = []
     buffer = ""
 
-    for i, part in enumerate(parts):
+    for part in parts:
         if _ANCHOR_RE.fullmatch(part.strip()):
             buffer += part
             posts.append(buffer)
@@ -187,7 +146,6 @@ def _split_by_anchors(raw: str) -> list[str]:
         else:
             buffer += part
 
-    # Хвост без якоря — не пост, игнорируем
     return posts
 
 
@@ -198,20 +156,16 @@ def _parse_posts(raw: str) -> list[str]:
 
     raw = _clean_unicode(raw)
     logger.info("После _clean_unicode: %d символов", len(raw))
-    logger.info("Первые 200 символов (repr): %r", raw[:200])
+    logger.info("Первые 120 символов: %r", raw[:120])
 
-    raw = _strip_thinking(raw)
-    if not raw:
-        logger.error("После _strip_thinking текст пуст")
-        return []
-
-    parts = _split_by_delimiter(raw)
-    if parts is None:
-        logger.warning("Разделители не найдены — пробую anchor-fallback")
+    # Основной путь: разделитель ===POST===
+    if _DELIMITER.search(raw):
+        parts = _DELIMITER.split(raw)
+        logger.info("Разделитель ===POST=== сработал, частей: %d", len(parts))
+    else:
+        logger.warning("Разделитель не найден, использую anchor-fallback")
         parts = _split_by_anchors(raw)
-        if not parts:
-            logger.warning("Anchor-fallback не нашёл ни одного поста")
-            return []
+        logger.info("Anchor-fallback вернул частей: %d", len(parts))
 
     posts: list[str] = []
     for i, part in enumerate(parts):
@@ -220,8 +174,8 @@ def _parse_posts(raw: str) -> list[str]:
             posts.append(cleaned)
         elif cleaned:
             logger.warning(
-                "Пост #%d отклонён. Первые 120 символов: %r",
-                i, cleaned[:120],
+                "Пост #%d отклонён (len=%d, первые 100): %r",
+                i, len(cleaned), cleaned[:100],
             )
 
     return posts
@@ -255,7 +209,7 @@ async def summarize_news(articles: list[dict]) -> list[str]:
             )
 
             raw = response.choices[0].message.content or ""
-            logger.info("Сырой ответ (%d символов):\n%s", len(raw), raw)
+            logger.info("Сырой ответ (%d символов)", len(raw))
 
             posts = _parse_posts(raw)
             if posts:
