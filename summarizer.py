@@ -2,8 +2,7 @@
 Суммаризация новостей через OpenRouter.
 
 Формат ответа — обычный текст с разделителем ===POST===.
-Никакого JSON и никакой "очистки размышлений" — используем non-reasoning модели,
-которые отдают чистый текст сразу.
+Тематика: только смартфоны, ожидаемые новинки, прототипы.
 """
 import logging
 import re
@@ -24,43 +23,27 @@ _client = AsyncOpenAI(
     api_key=OPENROUTER_KEY,
 )
 
+# --- Компактный промпт: только смартфоны ---
+
 SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphoneshub.
 
-Канал публикует ТОЛЬКО новости о смартфонах: анонсы, обзоры, утечки,
-ожидаемые новинки, прототипы и концепты.
+Создай 3–5 постов ТОЛЬКО о смартфонах: анонсы, утечки, обзоры,
+ожидаемые новинки, прототипы, даты презентаций, характеристики.
 
-=== ЧТО ПОДХОДИТ ===
-- Новые модели смартфонов (Samsung Galaxy, iPhone, Pixel, Xiaomi, Redmi,
-  POCO, Huawei, Honor, OPPO, vivo, realme, OnePlus, Motorola, Nothing,
-  ASUS Zenfone/ROG, Sony Xperia, Infinix, Tecno, Fold/Flip-модели)
-- Утечки, рендеры, слухи о будущих смартфонах
-- Прототипы и концепты смартфонов
-- Анонсы дат презентаций, старта продаж
-- Обзоры, тесты, бенчмарки смартфонов
-- Сравнения смартфонов друг с другом
+ИГНОРИРУЙ новости про: наушники, часы, планшеты, ноутбуки,
+умный дом, камеры, тарифы операторов, Android Auto, ТВ, игры,
+софт (если он не про смартфон напрямую).
 
-=== ЧТО НЕ ПОДХОДИТ (ИГНОРИРУЙ) ===
-- Наушники, TWS, гарнитуры, колонки, звук
-- Умные часы, браслеты, кольца, носимые устройства
-- Планшеты, ноутбуки, компьютеры
-- Умный дом, камеры видеонаблюдения, роботы-пылесосы
-- Тарифы, операторы связи, подписки
-- Android Auto, CarPlay, автомобильные системы
-- Телевизоры, консоли, игры
-- Софт и приложения (кроме случаев, когда это напрямую про смартфон)
-
-Если в списке новостей меньше 3 подходящих по теме — сделай
-столько постов, сколько есть. Не добавляй новости из «не подходит»
-ради количества.
+Если подходящих новостей меньше 3 — сделай сколько есть.
+Не добавляй посторонние новости ради количества.
 
 Требования к каждому посту:
 - Эмодзи в начале (📱, 🔥, 💡, 📸, ⚡, 🚀, 🎯, 🆕)
 - Заголовок на русском (до 80 символов)
 - 2–3 предложения: модели, характеристики, цифры, сроки
-- В конце — ссылка точно в формате <a href="URL">Источник</a>
-- Длина — до 600 символов
-- Тон: информативный, нейтральный
-- Всё на русском языке
+- В конце — ссылка: <a href="URL">Источник</a>
+- До 600 символов
+- Тон информативный, всё на русском
 
 ФОРМАТ ОТВЕТА:
 
@@ -68,62 +51,44 @@ SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphonesh
 
 📱 Заголовок первого поста
 Текст первого поста.
-<a href="https://example.com/1">Источник</a>
+<a href="URL1">Источник</a>
 
 ===POST===
 
 🔥 Заголовок второго поста
 Текст второго поста.
-<a href="https://example.com/2">Источник</a>
+<a href="URL2">Источник</a>
 
-ПРАВИЛА:
-- Между постами — строго строка ===POST=== (три знака =, слово POST, три знака =)
-- НЕ используй JSON, markdown, нумерацию
-- НЕ добавляй пояснений до или после постов
-- URL в ссылке должен быть из исходных данных (не выдумывай)
+Без JSON, без markdown, без пояснений до/после постов.
+URL брать из исходных данных, не выдумывать.
 """
 
 
-# ---------- Утилиты ----------
-
 def _clean_unicode(text: str) -> str:
-    """
-    Нормализует строку:
-    - собирает surrogate pairs в code points (📱 и т.п.)
-    - удаляет lone surrogates, BOM, zero-width символы
-    - заменяет нестандартные Unicode-пробелы на обычные
-    """
+    """Убирает BOM, zero-width, surrogate pairs."""
     if not text:
         return text
-
     try:
         text = text.encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
     except (UnicodeDecodeError, UnicodeEncodeError):
         text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
-
     text = re.sub(r"[\u200b-\u200f\ufeff\u2028\u2029]", "", text)
     text = re.sub(r"[\u00a0\u2000-\u200a\u202f\u205f\u3000]", " ", text)
-
     return text
 
 
 def _clean_post(text: str) -> str:
     """Убирает служебные обёртки вокруг одного поста."""
     text = text.strip()
-
-    # Markdown-обёртки
     text = re.sub(r"^```[\w]*\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
-
-    # Схлопываем множественные пробелы/переводы строк
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-
     return text.strip()
 
 
 def _is_emoji(ch: str) -> bool:
-    """Грубая проверка на эмодзи по Unicode-диапазонам."""
+    """Проверка на эмодзи по Unicode-диапазонам."""
     cp = ord(ch)
     return (
         0x1F300 <= cp <= 0x1FAFF
@@ -134,7 +99,7 @@ def _is_emoji(ch: str) -> bool:
 
 
 def _is_valid_post(text: str, max_len: int = 600) -> bool:
-    """Проверяет, что пост соответствует требованиям канала."""
+    """Пост должен начинаться с эмодзи, содержать <a href= и кириллицу."""
     if not text or len(text) > max_len:
         return False
     stripped = text.strip()
@@ -147,21 +112,15 @@ def _is_valid_post(text: str, max_len: int = 600) -> bool:
     return True
 
 
-# ---------- Разбор ответа на посты ----------
-
 _DELIMITER = re.compile(r"===+\s*POST\s*===+", re.IGNORECASE)
 _ANCHOR_RE = re.compile(r'<a\s+href="[^"]+"\s*>\s*Источник\s*</a>')
 
 
 def _split_by_anchors(raw: str) -> list[str]:
-    """
-    Fallback: разбивает текст по ссылкам <a href="...">Источник</a>.
-    Каждый пост заканчивается такой ссылкой.
-    """
+    """Fallback: разбивает по <a>...</a>."""
     parts = _ANCHOR_RE.split(raw)
     posts: list[str] = []
     buffer = ""
-
     for part in parts:
         if _ANCHOR_RE.fullmatch(part.strip()):
             buffer += part
@@ -169,25 +128,23 @@ def _split_by_anchors(raw: str) -> list[str]:
             buffer = ""
         else:
             buffer += part
-
     return posts
 
 
 def _parse_posts(raw: str) -> list[str]:
-    """Полный конвейер: очистка → разбиение → валидация."""
-    if not raw:
+    """Очистка → разбиение → валидация."""
+    if not raw or len(raw) < 30:
+        logger.warning("Ответ модели слишком короткий (%d символов)", len(raw))
         return []
 
     raw = _clean_unicode(raw)
     logger.info("После _clean_unicode: %d символов", len(raw))
-    logger.info("Первые 120 символов: %r", raw[:120])
 
-    # Основной путь: разделитель ===POST===
     if _DELIMITER.search(raw):
         parts = _DELIMITER.split(raw)
         logger.info("Разделитель ===POST=== сработал, частей: %d", len(parts))
     else:
-        logger.warning("Разделитель не найден, использую anchor-fallback")
+        logger.warning("Разделитель не найден, anchor-fallback")
         parts = _split_by_anchors(raw)
         logger.info("Anchor-fallback вернул частей: %d", len(parts))
 
@@ -198,14 +155,12 @@ def _parse_posts(raw: str) -> list[str]:
             posts.append(cleaned)
         elif cleaned:
             logger.warning(
-                "Пост #%d отклонён (len=%d, первые 100): %r",
+                "Пост #%d отклонён (len=%d): %r",
                 i, len(cleaned), cleaned[:100],
             )
 
     return posts
 
-
-# ---------- Публичный API ----------
 
 async def summarize_news(articles: list[dict]) -> list[str]:
     """Превращает новости в готовые посты через OpenRouter."""
@@ -214,7 +169,7 @@ async def summarize_news(articles: list[dict]) -> list[str]:
 
     news_text = "\n\n".join(
         f"Заголовок: {a['title']}\n"
-        f"Описание: {a.get('summary', '')[:300]}\n"
+        f"Описание: {a.get('summary', '')[:250]}\n"
         f"Ссылка: {a['link']}"
         for a in articles[:30]
     )
@@ -228,12 +183,33 @@ async def summarize_news(articles: list[dict]) -> list[str]:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": news_text},
                 ],
-                temperature=0.5,
-                max_tokens=2500,
+                temperature=0.3,
+                max_tokens=4096,
             )
 
-            raw = response.choices[0].message.content or ""
-            logger.info("Сырой ответ (%d символов)", len(raw))
+            # --- Диагностика: finish_reason и usage ---
+            choice = response.choices[0]
+            finish = getattr(choice, "finish_reason", "unknown")
+            usage = getattr(response, "usage", None)
+            if usage:
+                logger.info(
+                    "usage: prompt=%s, completion=%s, total=%s, finish=%s",
+                    getattr(usage, "prompt_tokens", "?"),
+                    getattr(usage, "completion_tokens", "?"),
+                    getattr(usage, "total_tokens", "?"),
+                    finish,
+                )
+            else:
+                logger.info("finish_reason=%s (usage отсутствует)", finish)
+
+            raw = choice.message.content or ""
+            logger.info("Сырой ответ (%d символов):\n%s", len(raw), raw[:800])
+
+            if finish == "length":
+                logger.error(
+                    "Модель %s упёрлась в max_tokens — увеличь лимит "
+                    "или сократи входные данные", model,
+                )
 
             posts = _parse_posts(raw)
             if posts:
