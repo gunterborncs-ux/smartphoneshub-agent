@@ -127,7 +127,25 @@ async def run_cycle() -> None:
 
     if not posts:
         return
+# main.py — в функции run_cycle() перед публикацией
 
+async def run_cycle() -> None:
+    # ... сбор, дедуп, суммаризация ...
+
+    posts = await summarize_news(articles)
+
+    # Финальная страховка: отсекаем посты-«утечки»
+    posts = [
+        p for p in posts
+        if not any(marker in p.lower() for marker in (
+            "thinking process", "chain of thought", "analyze user input",
+            "here's a", "let me think", "analyze the request",
+        ))
+    ]
+
+    posts = posts[:MAX_POSTS_PER_RUN]
+    # ... публикация ...
+    
     # 5. Публикация
     bot = Bot(token=BOT_TOKEN)
     try:
