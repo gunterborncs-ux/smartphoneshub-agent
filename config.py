@@ -15,10 +15,9 @@ CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@smartphoneshub")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
-# Модели с гарантированной поддержкой структурированного вывода (JSON schema)
-# Primary: Cohere North Mini Code — 30B MoE, 256K контекст, JSON schema
+# Primary: Cohere North Mini Code — 256K контекст, отработал в логах
 PRIMARY_MODEL = "cohere/north-mini-code:free"
-# Fallback: NVIDIA Nemotron 3 Super — 120B MoE, 1M контекст, schema
+# Fallback: NVIDIA Nemotron 3 Super
 FALLBACK_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 # --- Агент ---
