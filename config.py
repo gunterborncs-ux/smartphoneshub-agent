@@ -15,8 +15,8 @@ CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@smartphoneshub")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
-# Основная модель: Qwen 3.6 Plus (бесплатная, 1M контекст)
-PRIMARY_MODEL = "qwen/qwen3.6-plus:free"
+# Основная модель: llama-3.3-70b (бесплатная)
+PRIMARY_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 # Fallback: Free Models Router (автовыбор случайной бесплатной модели)
 FALLBACK_MODEL = "openrouter/free"
 
