@@ -26,3 +26,7 @@ MAX_POSTS_PER_RUN = 5              # максимум постов за один
 SIMILARITY_THRESHOLD = 0.82        # порог семантической дедупликации
 HISTORY_FILE = "published.json"    # файл истории опубликованных URL
 POST_DELAY_SECONDS = 3             # пауза между постами (rate-limit Telegram)
+
+# --- Уведомления об ошибках ---
+# Ваш Telegram user ID (узнать у @userinfobot). 0 = уведомления отключены.
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
