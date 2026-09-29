@@ -2,7 +2,9 @@
 Суммаризация новостей через OpenRouter.
 
 Использует structured output (JSON schema) для гарантированного формата.
-Валидирует каждый пост перед возвратом.
+Парсит ответ через json.loads(strict=False) + JSONDecoder.raw_decode —
+это устойчиво к control-символам (неэкранированные \n, \t, \r),
+которые часто встречаются в ответах LLM.
 """
 import json
 import logging
@@ -87,25 +89,42 @@ def _strip_thinking(text: str) -> str:
 def _extract_json(text: str) -> dict | None:
     """
     Извлекает JSON-объект из ответа модели.
-    Сначала пробует прямой парсинг, затем — поиск { ... } внутри текста.
+
+    Три стратегии:
+    1. json.loads с strict=False — терпит неэкранированные control-символы.
+    2. raw_decode — парсит первый валидный JSON и игнорирует хвост.
+    3. Поиск { ... } в тексте — на случай преамбулы до JSON.
     """
     text = _strip_thinking(text)
+    if not text:
+        return None
 
+    # Стратегия 1: прямой парсинг с strict=False
     try:
-        return json.loads(text)
+        return json.loads(text, strict=False)
     except json.JSONDecodeError:
         pass
 
+    # Стратегия 2: raw_decode — парсит первый объект и игнорирует остаток
+    try:
+        decoder = json.JSONDecoder(strict=False)
+        obj, _ = decoder.raw_decode(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+
+    # Стратегия 3: ищем {...} внутри текста (если была преамбула)
     start = text.find("{")
     end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1], strict=False)
+        except json.JSONDecodeError as exc:
+            logger.error("JSONDecodeError (fragment %d..%d): %s", start, end, exc)
+            return None
 
-    try:
-        return json.loads(text[start:end + 1])
-    except json.JSONDecodeError as exc:
-        logger.error("Не удалось распарсить JSON: %s", exc)
-        return None
+    return None
 
 
 def _is_emoji(ch: str) -> bool:
@@ -166,16 +185,25 @@ async def summarize_news(articles: list[dict]) -> list[str]:
             )
 
             raw = response.choices[0].message.content or ""
-            logger.info("Сырой ответ (%d символов): %s", len(raw), raw[:300])
+            # Логируем ПОЛНЫЙ ответ, чтобы при сбое видеть реальный JSON
+            logger.info("Сырой ответ (%d символов):\n%s", len(raw), raw)
 
             data = _extract_json(raw)
-            if not data or "posts" not in data:
-                logger.warning("Модель %s: нет поля 'posts'", model)
+            if not data:
+                logger.warning("Модель %s: не удалось распарсить JSON", model)
+                continue
+
+            if "posts" not in data:
+                logger.warning(
+                    "Модель %s: нет поля 'posts'. Ключи: %s",
+                    model, list(data.keys()),
+                )
                 continue
 
             posts_raw = data["posts"]
             if not isinstance(posts_raw, list):
-                logger.warning("Модель %s: 'posts' не список", model)
+                logger.warning("Модель %s: 'posts' не список, а %s",
+                               model, type(posts_raw).__name__)
                 continue
 
             valid_posts: list[str] = []
@@ -196,8 +224,6 @@ async def summarize_news(articles: list[dict]) -> list[str]:
 
             logger.warning("Модель %s: ни один пост не прошёл валидацию", model)
 
-        except json.JSONDecodeError as exc:
-            logger.error("Модель %s вернула не JSON: %s", model, exc)
         except Exception as exc:
             logger.error("Ошибка модели %s: %s", model, exc, exc_info=True)
 
