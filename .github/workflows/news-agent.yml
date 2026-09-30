@@ -3,7 +3,7 @@ name: Smartphones News Agent
 on:
   schedule:
     # 4 раза в день (UTC): 5:00, 9:00, 13:00, 17:00
-    - cron: '0 5,9,13,17 * * *'
+    - cron: '30 5,9,13,17 * * *'
   # Ручной запуск для тестирования
   workflow_dispatch:
 
