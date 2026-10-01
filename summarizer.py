@@ -85,13 +85,73 @@ def _clean_unicode(text: str) -> str:
     return text
 
 
+def _bold_first_line(text: str) -> str:
+    """
+    Гарантирует, что заголовок (первая строка после эмодзи)
+    обёрнут в <b>...</b>.
+
+    - Если уже есть <b> в первой строке — ничего не делает.
+    - Иначе: отделяет эмодзи, оборачивает остаток первой строки в <b>.
+    """
+    if not text:
+        return text
+
+    # Если в первой строке уже есть <b> — не трогаем
+    first_line_end = text.find("\n")
+    first_line = text if first_line_end == -1 else text[:first_line_end]
+    if "<b>" in first_line:
+        return text
+
+    # Отделяем эмодзи (1-3 символа подряд) от заголовка
+    # Эмодзи — это code points из диапазонов 0x1F300+
+    emoji_end = 0
+    for ch in first_line:
+        cp = ord(ch)
+        is_emoji = (
+            0x1F300 <= cp <= 0x1FAFF
+            or 0x1F000 <= cp <= 0x1F2FF
+            or 0x2600 <= cp <= 0x27BF
+            or 0x2B00 <= cp <= 0x2BFF
+            or ch == "\u200d"  # zero-width joiner для составных эмодзи
+            or 0xFE00 <= cp <= 0xFE0F  # variation selectors
+        )
+        if is_emoji or ch == " ":
+            emoji_end += 1
+        else:
+            break
+
+    emoji_part = first_line[:emoji_end].rstrip()
+    title_part = first_line[emoji_end:].strip()
+
+    if not title_part:
+        return text  # заголовка нет, оставляем как есть
+
+    # Собираем обратно
+    new_first_line = f"{emoji_part} <b>{title_part}</b>".strip()
+    rest = text[first_line_end:] if first_line_end != -1 else ""
+    return new_first_line + rest
+
+
 def _clean_post(text: str) -> str:
     """Убирает служебные обёртки вокруг одного поста."""
     text = text.strip()
+
+    # Markdown-обёртки
     text = re.sub(r"^```[\w]*\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
+
+    # На случай, если модель использовала **жирный** вместо <b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+    # Схлопываем множественные пробелы/переводы строк
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+
+    text = text.strip()
+
+    # Гарантируем жирный заголовок
+    text = _bold_first_line(text)
+
     return text.strip()
 
 
