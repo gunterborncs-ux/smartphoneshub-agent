@@ -1,7 +1,8 @@
 """
-Smartphones News Agent — точка входа.
+Smartphones News Agent.
 
-Публикует посты с медиа (фото/видео из RSS), источник — голой ссылкой.
+Публикует посты со всеми фото из RSS (альбом при 2+ изображениях),
+ссылка — <a href="URL">Источник</a>.
 """
 import asyncio
 import logging
@@ -11,6 +12,7 @@ import traceback
 import aiohttp
 import feedparser
 from aiogram import Bot
+from aiogram.types import InputMediaPhoto
 
 from config import (
     BOT_TOKEN,
@@ -45,23 +47,30 @@ _LEAK_MARKERS = (
     "here's a", "let me think", "мысленный процесс", "размышляю",
 )
 
-# Извлекаем URL из поста — теперь и из голых ссылок
-_URL_RE = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
+_HREF_RE = re.compile(r'<a\s+href="([^"]+)"', re.IGNORECASE)
+_MAX_PHOTOS_PER_POST = 10  # лимит Telegram для sendMediaGroup
 
 
 def _html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-# ---------- Извлечение медиа из RSS-записей ----------
+# ---------- Извлечение медиа из RSS ----------
 
-def _extract_media(entry: dict) -> tuple[str | None, str | None]:
+def _extract_media(entry: dict) -> tuple[list[str], str | None]:
     """
-    Возвращает (image_url, video_url).
-    Пробует media_content, media_thumbnail, enclosures, <img> в summary.
+    Возвращает (images, video_url).
+    Собирает все изображения из media_content, media_thumbnail,
+    enclosures и <img> в summary. Дубликаты убираются.
     """
-    image: str | None = None
+    images: list[str] = []
+    seen: set[str] = set()
     video: str | None = None
+
+    def _add_image(url: str) -> None:
+        if url and url not in seen:
+            seen.add(url)
+            images.append(url)
 
     for mc in (entry.get("media_content") or []):
         url = mc.get("url", "")
@@ -70,15 +79,11 @@ def _extract_media(entry: dict) -> tuple[str | None, str | None]:
             continue
         if mtype.startswith("video/") and not video:
             video = url
-        elif mtype.startswith("image/") and not image:
-            image = url
+        elif mtype.startswith("image/"):
+            _add_image(url)
 
-    if not image:
-        for mt in (entry.get("media_thumbnail") or []):
-            url = mt.get("url", "")
-            if url:
-                image = url
-                break
+    for mt in (entry.get("media_thumbnail") or []):
+        _add_image(mt.get("url", ""))
 
     for enc in (entry.get("enclosures") or []):
         url = enc.get("href") or enc.get("url", "")
@@ -87,16 +92,15 @@ def _extract_media(entry: dict) -> tuple[str | None, str | None]:
             continue
         if mtype.startswith("video/") and not video:
             video = url
-        elif mtype.startswith("image/") and not image:
-            image = url
+        elif mtype.startswith("image/"):
+            _add_image(url)
 
-    if not image:
-        summary = entry.get("summary", "") or ""
-        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', summary)
-        if m:
-            image = m.group(1)
+    # Изображения из HTML в summary
+    summary = entry.get("summary", "") or ""
+    for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', summary):
+        _add_image(m.group(1))
 
-    return image, video
+    return images, video
 
 
 # ---------- RSS ----------
@@ -112,12 +116,12 @@ async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
             link = (entry.get("link") or "").strip()
             if not title or not link:
                 continue
-            image, video = _extract_media(entry)
+            images, video = _extract_media(entry)
             articles.append({
                 "title": title,
                 "link": link,
                 "summary": (entry.get("summary") or "").strip(),
-                "image": image,
+                "images": images,
                 "video": video,
             })
         return articles
@@ -148,22 +152,24 @@ async def collect_all_news() -> list[dict]:
     return relevant
 
 
-# ---------- Сопоставление поста с исходной статьёй ----------
+# ---------- Матчинг пост → статья ----------
 
 def _match_article(post: str, articles: list[dict]) -> dict | None:
-    """Находит исходную статью по URL из поста (для получения медиа)."""
-    urls_in_post = set(_URL_RE.findall(post))
-    if not urls_in_post:
+    """
+    Находит исходную статью по URL из <a href="..."> в посте.
+    """
+    hrefs = set(_HREF_RE.findall(post))
+    if not hrefs:
         return None
     for article in articles:
-        if article.get("link") in urls_in_post:
+        if article.get("link") in hrefs:
             return article
-    # Нормализация: убираем trailing slash
+    # Fallback: нормализация без trailing slash
     for article in articles:
         norm = (article.get("link") or "").rstrip("/")
         if not norm:
             continue
-        for url in urls_in_post:
+        for url in hrefs:
             if url.rstrip("/") == norm:
                 return article
     return None
@@ -187,36 +193,75 @@ async def notify_admin(bot: Bot, reason: str, details: str = "") -> None:
         logger.error("Не удалось отправить уведомление: %s", exc)
 
 
-# ---------- Публикация с медиа ----------
+# ---------- Публикация ----------
 
 async def _send_single_post(
-    bot: Bot, post: str, image: str | None, video: str | None,
+    bot: Bot, post: str, images: list[str], video: str | None,
 ) -> bool:
-    """Отправляет пост: видео → фото → текст (с фолбэками)."""
+    """
+    Отправляет пост с максимальным покрытием медиа.
+
+    Порядок попыток:
+    1. Видео (send_video) — если есть video и он один, теряем галерею.
+    2. Альбом из 2+ фото (send_media_group).
+    3. Одно фото (send_photo).
+    4. Текст (send_message).
+    """
+    # 1) Видео
     if video:
         try:
             await bot.send_video(
-                chat_id=CHANNEL_ID, video=video, caption=post, parse_mode="HTML",
+                chat_id=CHANNEL_ID,
+                video=video,
+                caption=post,
+                parse_mode="HTML",
             )
             logger.info("Пост с видео: %s...", post[:60])
             return True
         except Exception as exc:
             logger.warning("Видео не отправилось, fallback: %s", exc)
 
-    if image:
+    # 2) Альбом (2–10 фото)
+    photos = images[:_MAX_PHOTOS_PER_POST]
+    if len(photos) >= 2:
+        try:
+            media = [
+                InputMediaPhoto(
+                    media=url,
+                    caption=post if i == 0 else None,
+                    parse_mode="HTML" if i == 0 else None,
+                )
+                for i, url in enumerate(photos)
+            ]
+            await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+            logger.info(
+                "Пост-альбом (%d фото): %s...", len(photos), post[:60],
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Альбом не отправился, fallback: %s", exc)
+
+    # 3) Одно фото
+    if photos:
         try:
             await bot.send_photo(
-                chat_id=CHANNEL_ID, photo=image, caption=post, parse_mode="HTML",
+                chat_id=CHANNEL_ID,
+                photo=photos[0],
+                caption=post,
+                parse_mode="HTML",
             )
             logger.info("Пост с фото: %s...", post[:60])
             return True
         except Exception as exc:
             logger.warning("Фото не отправилось, fallback: %s", exc)
 
+    # 4) Текст
     try:
         await bot.send_message(
-            chat_id=CHANNEL_ID, text=post,
-            parse_mode="HTML", disable_web_page_preview=True,
+            chat_id=CHANNEL_ID,
+            text=post,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
         logger.info("Текстовый пост: %s...", post[:60])
         return True
@@ -231,18 +276,19 @@ async def publish_posts(
     published: list[str] = []
     for post in posts:
         article = _match_article(post, articles)
-        image = article.get("image") if article else None
+        images = article.get("images", []) if article else []
         video = article.get("video") if article else None
-        if await _send_single_post(bot, post, image, video):
+        if await _send_single_post(bot, post, images, video):
             published.append(post)
             await asyncio.sleep(POST_DELAY_SECONDS)
     return published
 
 
 def extract_urls(posts: list[str]) -> set[str]:
+    """URL источников из <a href="...">."""
     urls: set[str] = set()
     for post in posts:
-        for m in _URL_RE.findall(post):
+        for m in _HREF_RE.findall(post):
             urls.add(m)
     return urls
 
