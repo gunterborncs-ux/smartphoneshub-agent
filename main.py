@@ -1,10 +1,7 @@
 """
 Smartphones News Agent — точка входа.
 
-Запускается по расписанию GitHub Actions, выполняет один цикл:
-сбор RSS → фильтрация → дедупликация → суммаризация → публикация → сохранение истории.
-
-Тематика: только смартфоны, ожидаемые новинки, прототипы.
+Публикует посты с медиа (фото/видео из RSS), источник — голой ссылкой.
 """
 import asyncio
 import logging
@@ -27,12 +24,7 @@ from config import (
     HISTORY_RETENTION_DAYS,
 )
 from dedup import deduplicate
-from rss_sources import (
-    RSS_FEEDS,
-    BRAND_MARKERS,
-    PHONE_KEYWORDS,
-    STOP_WORDS,
-)
+from rss_sources import RSS_FEEDS, BRAND_MARKERS, PHONE_KEYWORDS, STOP_WORDS
 from storage import (
     load_history,
     save_history,
@@ -42,109 +34,110 @@ from storage import (
 )
 from summarizer import summarize_news
 
-# --- Логирование ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("agent")
 
-# --- Маркеры «утечки» reasoning-модели (страховка) ---
 _LEAK_MARKERS = (
-    "thinking process",
-    "chain of thought",
-    "analyze user input",
-    "analyze the request",
-    "here's a",
-    "let me think",
-    "мысленный процесс",
-    "размышляю",
+    "thinking process", "chain of thought", "analyze user input",
+    "here's a", "let me think", "мысленный процесс", "размышляю",
 )
 
-# --- Извлечение URL из HTML-ссылки в посте ---
-_URL_RE = re.compile(r'<a\s+href="([^"]+)"')
+# Извлекаем URL из поста — теперь и из голых ссылок
+_URL_RE = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
 
 
-# ---------- Уведомления админу ----------
+def _html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-async def notify_admin(bot: Bot, reason: str, details: str = "") -> None:
+
+# ---------- Извлечение медиа из RSS-записей ----------
+
+def _extract_media(entry: dict) -> tuple[str | None, str | None]:
     """
-    Отправляет уведомление админу в личку.
-    Молча игнорирует ошибки — уведомление не должно ронять цикл.
+    Возвращает (image_url, video_url).
+    Пробует media_content, media_thumbnail, enclosures, <img> в summary.
     """
-    if not ADMIN_CHAT_ID:
-        logger.info("ADMIN_CHAT_ID не задан — уведомление пропущено")
-        return
+    image: str | None = None
+    video: str | None = None
 
-    text = f"⚠️ <b>Smartphones News Agent</b>\n\n{reason}"
-    if details:
-        text += f"\n\n<code>{details[:800]}</code>"
+    for mc in (entry.get("media_content") or []):
+        url = mc.get("url", "")
+        mtype = mc.get("type", "")
+        if not url:
+            continue
+        if mtype.startswith("video/") and not video:
+            video = url
+        elif mtype.startswith("image/") and not image:
+            image = url
 
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-        logger.info("Уведомление отправлено админу (%s)", ADMIN_CHAT_ID)
-    except Exception as exc:
-        logger.error("Не удалось отправить уведомление админу: %s", exc)
+    if not image:
+        for mt in (entry.get("media_thumbnail") or []):
+            url = mt.get("url", "")
+            if url:
+                image = url
+                break
+
+    for enc in (entry.get("enclosures") or []):
+        url = enc.get("href") or enc.get("url", "")
+        mtype = enc.get("type", "")
+        if not url:
+            continue
+        if mtype.startswith("video/") and not video:
+            video = url
+        elif mtype.startswith("image/") and not image:
+            image = url
+
+    if not image:
+        summary = entry.get("summary", "") or ""
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', summary)
+        if m:
+            image = m.group(1)
+
+    return image, video
 
 
 # ---------- RSS ----------
 
 async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
-    """Асинхронно забирает и парсит одну RSS-ленту."""
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
             raw = await resp.read()
         feed = feedparser.parse(raw)
-        return [
-            {
-                "title": entry.get("title", "").strip(),
-                "link": entry.get("link", "").strip(),
-                "summary": entry.get("summary", "").strip(),
-            }
-            for entry in feed.entries[:15]
-            if entry.get("title") and entry.get("link")
-        ]
+        articles: list[dict] = []
+        for entry in feed.entries[:15]:
+            title = (entry.get("title") or "").strip()
+            link = (entry.get("link") or "").strip()
+            if not title or not link:
+                continue
+            image, video = _extract_media(entry)
+            articles.append({
+                "title": title,
+                "link": link,
+                "summary": (entry.get("summary") or "").strip(),
+                "image": image,
+                "video": video,
+            })
+        return articles
     except Exception as exc:
         logger.warning("RSS %s: %s", url, exc)
         return []
 
 
 def is_relevant(article: dict) -> bool:
-    """
-    Проверяет, относится ли статья к смартфонам/ожидаемым новинкам/прототипам.
-
-    Логика:
-    - Есть хотя бы один стоп-ворд → отклонить.
-    - Есть маркер бренда смартфонов → принять.
-    - Либо есть >= 1 маркер из PHONE_KEYWORDS → принять.
-    - Иначе отклонить.
-    """
-    title = article.get("title", "").lower()
-    summary = article.get("summary", "").lower()
-    text = title + " " + summary
-
-    # 1. Стоп-слова — жёсткое отклонение
+    text = (article.get("title", "") + " " + article.get("summary", "")).lower()
     if any(stop in text for stop in STOP_WORDS):
         return False
-
-    # 2. Маркеры брендов (Samsung, Xiaomi, ...)
     if any(brand in text for brand in BRAND_MARKERS):
         return True
-
-    # 3. Общие ключевые слова про смартфоны / утечки / прототипы
     if any(kw in text for kw in PHONE_KEYWORDS):
         return True
-
     return False
 
 
 async def collect_all_news() -> list[dict]:
-    """Параллельно собирает все RSS-ленты и фильтрует релевантные."""
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_rss(session, url) for url in RSS_FEEDS]
         results = await asyncio.gather(*tasks)
@@ -155,163 +148,172 @@ async def collect_all_news() -> list[dict]:
     return relevant
 
 
-# ---------- Публикация ----------
+# ---------- Сопоставление поста с исходной статьёй ----------
 
-async def publish_posts(bot: Bot, posts: list[str]) -> list[str]:
-    """Публикует посты в Telegram-канал."""
+def _match_article(post: str, articles: list[dict]) -> dict | None:
+    """Находит исходную статью по URL из поста (для получения медиа)."""
+    urls_in_post = set(_URL_RE.findall(post))
+    if not urls_in_post:
+        return None
+    for article in articles:
+        if article.get("link") in urls_in_post:
+            return article
+    # Нормализация: убираем trailing slash
+    for article in articles:
+        norm = (article.get("link") or "").rstrip("/")
+        if not norm:
+            continue
+        for url in urls_in_post:
+            if url.rstrip("/") == norm:
+                return article
+    return None
+
+
+# ---------- Уведомления ----------
+
+async def notify_admin(bot: Bot, reason: str, details: str = "") -> None:
+    if not ADMIN_CHAT_ID:
+        return
+    text = f"⚠️ <b>Smartphones Hub</b>\n\n{reason}"
+    if details:
+        text += f"\n\n<code>{_html_escape(details[:800])}</code>"
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_CHAT_ID, text=text,
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+        logger.info("Уведомление отправлено админу")
+    except Exception as exc:
+        logger.error("Не удалось отправить уведомление: %s", exc)
+
+
+# ---------- Публикация с медиа ----------
+
+async def _send_single_post(
+    bot: Bot, post: str, image: str | None, video: str | None,
+) -> bool:
+    """Отправляет пост: видео → фото → текст (с фолбэками)."""
+    if video:
+        try:
+            await bot.send_video(
+                chat_id=CHANNEL_ID, video=video, caption=post, parse_mode="HTML",
+            )
+            logger.info("Пост с видео: %s...", post[:60])
+            return True
+        except Exception as exc:
+            logger.warning("Видео не отправилось, fallback: %s", exc)
+
+    if image:
+        try:
+            await bot.send_photo(
+                chat_id=CHANNEL_ID, photo=image, caption=post, parse_mode="HTML",
+            )
+            logger.info("Пост с фото: %s...", post[:60])
+            return True
+        except Exception as exc:
+            logger.warning("Фото не отправилось, fallback: %s", exc)
+
+    try:
+        await bot.send_message(
+            chat_id=CHANNEL_ID, text=post,
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+        logger.info("Текстовый пост: %s...", post[:60])
+        return True
+    except Exception as exc:
+        logger.error("Ошибка публикации: %s", exc)
+        return False
+
+
+async def publish_posts(
+    bot: Bot, posts: list[str], articles: list[dict],
+) -> list[str]:
     published: list[str] = []
     for post in posts:
-        try:
-            await bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=post,
-                parse_mode="HTML",
-                disable_web_page_preview=False,
-            )
+        article = _match_article(post, articles)
+        image = article.get("image") if article else None
+        video = article.get("video") if article else None
+        if await _send_single_post(bot, post, image, video):
             published.append(post)
-            logger.info("Опубликован пост: %s...", post[:60])
             await asyncio.sleep(POST_DELAY_SECONDS)
-        except Exception as exc:
-            logger.error("Ошибка публикации: %s", exc)
     return published
 
 
 def extract_urls(posts: list[str]) -> set[str]:
-    """Извлекает URL источников из опубликованных постов."""
     urls: set[str] = set()
     for post in posts:
-        for match in _URL_RE.findall(post):
-            urls.add(match)
+        for m in _URL_RE.findall(post):
+            urls.add(m)
     return urls
 
 
 # ---------- Основной цикл ----------
 
 async def run_cycle() -> None:
-    """Один полный цикл агента."""
     logger.info("=== Старт цикла ===")
-
     bot = Bot(token=BOT_TOKEN)
     try:
-        # --- 1. Сбор новостей ---
-        articles: list[dict] = await collect_all_news()
+        articles = await collect_all_news()
         if not articles:
-            logger.warning("RSS не вернули ни одной релевантной статьи.")
-            await notify_admin(
-                bot,
-                "🚨 <b>Не собрано ни одной релевантной статьи</b>",
-                "Проверь RSS-источники: возможно, ленты недоступны "
-                "или ключевые слова не совпали.",
-            )
+            logger.warning("Нет релевантных статей")
+            await notify_admin(bot, "🚨 <b>Не собрано ни одной релевантной статьи</b>")
             return
 
-        # --- 2. Ограничение по количеству ---
         articles = articles[:MAX_ARTICLES_PER_RUN]
-        logger.info("После ограничения по количеству: %d", len(articles))
-
-        # --- 3. Фильтр по истории опубликованного ---
         history = load_history(HISTORY_FILE)
         articles = filter_unpublished(articles, history)
         logger.info("После фильтра по истории: %d", len(articles))
 
         if not articles:
-            logger.info("Все статьи уже были опубликованы ранее.")
-            await notify_admin(
-                bot,
-                "ℹ️ <b>Все статьи уже опубликованы</b>",
-                f"RSS вернули только уже опубликованные URL "
-                f"(в истории {len(history)} записей).",
-            )
+            logger.info("Все статьи уже опубликованы")
             return
 
-        # --- 4. Дедупликация ---
         articles = deduplicate(articles, threshold=SIMILARITY_THRESHOLD)
         logger.info("После дедупликации: %d", len(articles))
-
         if not articles:
-            logger.warning("После дедупликации не осталось статей.")
-            await notify_admin(
-                bot,
-                "🚨 <b>После дедупликации не осталось статей</b>",
-                "Все статьи похожи друг на друга. Попробуй понизить "
-                "SIMILARITY_THRESHOLD в config.py (сейчас "
-                f"{SIMILARITY_THRESHOLD}).",
-            )
             return
 
-        # --- 5. Суммаризация через OpenRouter ---
-        posts: list[str] = await summarize_news(articles)
+        posts = await summarize_news(articles)
         logger.info("Сгенерировано постов: %d", len(posts))
 
-        # --- 6. Страховка: отсекаем «утечки» reasoning-модели ---
-        clean_posts: list[str] = []
-        for post in posts:
-            low = post.lower()
-            if any(marker in low for marker in _LEAK_MARKERS):
-                logger.warning("Отброшен пост с утечкой reasoning: %s", post[:80])
-                continue
-            clean_posts.append(post)
-
+        clean_posts = [
+            p for p in posts
+            if not any(marker in p.lower() for marker in _LEAK_MARKERS)
+        ]
         posts = clean_posts[:MAX_POSTS_PER_RUN]
-        logger.info("Постов после финального фильтра: %d", len(posts))
 
         if not posts:
-            logger.error("LLM не сгенерировала ни одного валидного поста.")
+            logger.error("Нет валидных постов")
             await notify_admin(
                 bot,
-                "🚨 <b>LLM не сгенерировала ни одного валидного поста</b>",
-                f"Статей на входе: {len(articles)}. "
-                f"Проверь логи GitHub Actions — вероятно, обе модели вернули "
-                f"некорректный формат или упали с ошибкой.",
+                "🚨 <b>LLM не сгенерировала валидных постов</b>",
+                f"Статей на входе: {len(articles)}",
             )
             return
 
-        # --- 7. Публикация ---
-        published = await publish_posts(bot, posts)
-
+        published = await publish_posts(bot, posts, articles)
         if not published:
-            logger.error("Ни один пост не опубликован — Telegram вернул ошибки.")
-            await notify_admin(
-                bot,
-                "🚨 <b>Ни один пост не удалось опубликовать</b>",
-                f"Сгенерировано {len(posts)} постов, но Telegram вернул ошибку "
-                f"на каждый. Проверь права бота в канале {CHANNEL_ID}.",
-            )
+            await notify_admin(bot, "🚨 <b>Ни один пост не опубликован</b>")
             return
 
-        # --- 8. Сохранение истории ---
         new_urls = extract_urls(published)
-        logger.info("Новых URL для истории: %d", len(new_urls))
-
-        # Добавляем новые URL с текущим таймстампом
         add_urls(history, new_urls)
-        logger.info("История до очистки: %d записей", len(history))
-
-        # Удаляем записи старше N дней
         history = cleanup_old(history, days=HISTORY_RETENTION_DAYS)
-        logger.info("История после очистки: %d записей", len(history))
-
         save_history(HISTORY_FILE, history)
 
         logger.info("=== Цикл завершён: опубликовано %d постов ===", len(published))
 
     except Exception as exc:
-        # Непредвиденная ошибка — тоже уведомляем
         tb = traceback.format_exc()
         logger.error("Необработанное исключение: %s", exc, exc_info=True)
-        await notify_admin(
-            bot,
-            "🚨 <b>Необработанное исключение в цикле</b>",
-            tb,
-        )
+        await notify_admin(bot, "🚨 <b>Необработанное исключение</b>", tb)
     finally:
         await bot.session.close()
 
 
 def main() -> None:
-    """Синхронная обёртка для asyncio.run()."""
     asyncio.run(run_cycle())
 
 
 if __name__ == "__main__":
-    main()
+    main()ы
