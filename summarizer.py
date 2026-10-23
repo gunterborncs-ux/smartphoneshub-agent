@@ -1,8 +1,8 @@
 """
-Суммаризация новостей через OpenRouter.
+Суммаризация новостей о смартфонах через OpenRouter.
 
-Формат ответа — обычный текст с разделителем ===POST===.
-Тематика: только смартфоны, ожидаемые новинки, прототипы.
+Формат поста: заголовок <b>, текст, голая ссылка (без «Источник»).
+Жёсткая языковая валидация: кириллицы должно быть >= 40%.
 """
 import logging
 import re
@@ -23,57 +23,62 @@ _client = AsyncOpenAI(
     api_key=OPENROUTER_KEY,
 )
 
-# --- Компактный промпт: только смартфоны ---
+SYSTEM_PROMPT = """Ты — редактор русскоязычного Telegram-канала @smartphoneshub.
 
-SYSTEM_PROMPT = """Ты — редактор Telegram-канала @smartphoneshub.
+⚠️ ГЛАВНОЕ ПРАВИЛО: все посты ТОЛЬКО на русском языке.
+Если новость на английском — ПЕРЕВЕДИ её на русский. Названия моделей
+(iPhone 17 Pro, Samsung Galaxy S25, Xiaomi 15) оставляй латиницей,
+всё остальное — по-русски.
 
-Создай 3–5 постов ТОЛЬКО о смартфонах: анонсы, утечки, обзоры,
+Создай от 3 до 5 постов ТОЛЬКО о смартфонах: анонсы, утечки, обзоры,
 ожидаемые новинки, прототипы, даты презентаций, характеристики.
 
 ИГНОРИРУЙ новости про: наушники, часы, планшеты, ноутбуки,
 умный дом, камеры, тарифы операторов, Android Auto, ТВ, игры,
 софт (если он не про смартфон напрямую).
 
-Если подходящих новостей меньше 3 — сделай сколько есть.
-Не добавляй посторонние новости ради количества.
-
 Требования к каждому посту:
 - Первая строка: эмодзи, пробел, затем ОБЯЗАТЕЛЬНО заголовок
-  в теге <b>...</b> (до 80 символов)
-- Вторая строка: пустая (пустая строка-разделитель)
-- Затем 2–3 предложения: модели, характеристики, цифры, сроки
-- В конце — ссылка: <a href="URL">Источник</a>
+  в теге <b>...</b> (до 80 символов, на русском)
+- Вторая строка: пустая
+- Затем 2–3 предложения НА РУССКОМ: модели, характеристики, цифры, сроки
+- В конце — ссылка: ГОЛЫЙ URL. Без тега <a href="...">,
+  без слова «Источник», без скобок вокруг ссылки.
 - До 600 символов
-- Тон информативный, всё на русском
-- Эмодзи ВНЕ тега <b>, например: 📱 <b>Заголовок</b>
+- Эмодзи ВНЕ тега <b>
 
-ФОРМАТ ОТВЕТА:
-
-===POST===
-
-📱 <b>Заголовок первого поста</b>
-
-Текст первого поста с фактами.
-<a href="URL1">Источник</a>
+ПРИМЕР ПРАВИЛЬНОГО ПОСТА:
 
 ===POST===
 
-🔥 <b>Заголовок второго поста</b>
+📱 <b>Samsung Galaxy S25 Ultra получил One UI 7.1</b>
 
-Текст второго поста.
-<a href="URL2">Источник</a>
+Обновление добавляет новые функции камеры и улучшенную работу с ИИ.
+Прошивка уже начала распространяться в Европе.
 
-ПРАВИЛА:
-- Между постами — строго строка ===POST===
-- НЕ используй JSON, markdown (**...**), нумерацию
-- Только HTML-теги <b> и <a href="...">
-- НЕ добавляй пояснений до или после постов
-- URL брать из исходных данных, не выдумывать
+https://example.com/article-1
+
+===POST===
+
+🔥 <b>Xiaomi анонсировала Redmi Note 14 Pro</b>
+
+Смартфон получил Snapdragon 7s Gen 3 и батарею 5500 мА·ч.
+Старт продаж — 15 ноября 2026 года.
+
+https://example.com/article-2
+
+ЗАПРЕЩЕНО:
+- Писать посты на английском
+- Использовать **markdown** вместо <b>
+- Оборачивать URL в <a href="...">
+- Добавлять слово «Источник» или похожие пометки
+- Добавлять пояснения до/после постов
+
+Между постами — строго строка ===POST===.
 """
 
 
 def _clean_unicode(text: str) -> str:
-    """Убирает BOM, zero-width, surrogate pairs."""
     if not text:
         return text
     try:
@@ -85,78 +90,29 @@ def _clean_unicode(text: str) -> str:
     return text
 
 
-def _bold_first_line(text: str) -> str:
-    """
-    Гарантирует, что заголовок (первая строка после эмодзи)
-    обёрнут в <b>...</b>.
-
-    - Если уже есть <b> в первой строке — ничего не делает.
-    - Иначе: отделяет эмодзи, оборачивает остаток первой строки в <b>.
-    """
-    if not text:
-        return text
-
-    # Если в первой строке уже есть <b> — не трогаем
-    first_line_end = text.find("\n")
-    first_line = text if first_line_end == -1 else text[:first_line_end]
-    if "<b>" in first_line:
-        return text
-
-    # Отделяем эмодзи (1-3 символа подряд) от заголовка
-    # Эмодзи — это code points из диапазонов 0x1F300+
-    emoji_end = 0
-    for ch in first_line:
-        cp = ord(ch)
-        is_emoji = (
-            0x1F300 <= cp <= 0x1FAFF
-            or 0x1F000 <= cp <= 0x1F2FF
-            or 0x2600 <= cp <= 0x27BF
-            or 0x2B00 <= cp <= 0x2BFF
-            or ch == "\u200d"  # zero-width joiner для составных эмодзи
-            or 0xFE00 <= cp <= 0xFE0F  # variation selectors
-        )
-        if is_emoji or ch == " ":
-            emoji_end += 1
-        else:
-            break
-
-    emoji_part = first_line[:emoji_end].rstrip()
-    title_part = first_line[emoji_end:].strip()
-
-    if not title_part:
-        return text  # заголовка нет, оставляем как есть
-
-    # Собираем обратно
-    new_first_line = f"{emoji_part} <b>{title_part}</b>".strip()
-    rest = text[first_line_end:] if first_line_end != -1 else ""
-    return new_first_line + rest
-
-
 def _clean_post(text: str) -> str:
-    """Убирает служебные обёртки вокруг одного поста."""
     text = text.strip()
-
-    # Markdown-обёртки
     text = re.sub(r"^```[\w]*\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
 
-    # На случай, если модель использовала **жирный** вместо <b>
+    # <a href="URL">текст</a> → голый URL
+    text = re.sub(
+        r'<a\s+href="([^"]+)"[^>]*>[^<]*</a>',
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # **жирный** → <b>жирный</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
 
-    # Схлопываем множественные пробелы/переводы строк
+    # Схлопываем пробелы/переводы строк
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-
-    text = text.strip()
-
-    # Гарантируем жирный заголовок
-    text = _bold_first_line(text)
-
     return text.strip()
 
 
 def _is_emoji(ch: str) -> bool:
-    """Проверка на эмодзи по Unicode-диапазонам."""
     cp = ord(ch)
     return (
         0x1F300 <= cp <= 0x1FAFF
@@ -166,55 +122,57 @@ def _is_emoji(ch: str) -> bool:
     )
 
 
+def _cyrillic_ratio(text: str) -> float:
+    cyr = len(re.findall(r"[А-Яа-яЁё]", text))
+    lat = len(re.findall(r"[A-Za-z]", text))
+    total = cyr + lat
+    return cyr / total if total else 0.0
+
+
 def _is_valid_post(text: str, max_len: int = 600) -> bool:
-    """Пост должен начинаться с эмодзи, содержать <a href= и кириллицу."""
+    """
+    Пост валиден, если:
+    - начинается с эмодзи
+    - содержит <b>...</b> (заголовок)
+    - содержит голый URL (http:// или https://)
+    - кириллицы >= 40%
+    - длина <= max_len
+    """
     if not text or len(text) > max_len:
         return False
     stripped = text.strip()
     if not stripped or not _is_emoji(stripped[0]):
         return False
-    if "<a href=" not in stripped:
+    if "<b>" not in stripped:
         return False
-    if not re.search(r"[А-Яа-яЁё]", stripped):
+    if not re.search(r"https?://", stripped):
+        return False
+
+    ratio = _cyrillic_ratio(stripped)
+    if ratio < 0.40:
+        logger.warning(
+            "Пост отклонён: кириллицы %.0f%% (<40%%). Начало: %r",
+            ratio * 100, stripped[:100],
+        )
         return False
     return True
 
 
 _DELIMITER = re.compile(r"===+\s*POST\s*===+", re.IGNORECASE)
-_ANCHOR_RE = re.compile(r'<a\s+href="[^"]+"\s*>\s*Источник\s*</a>')
-
-
-def _split_by_anchors(raw: str) -> list[str]:
-    """Fallback: разбивает по <a>...</a>."""
-    parts = _ANCHOR_RE.split(raw)
-    posts: list[str] = []
-    buffer = ""
-    for part in parts:
-        if _ANCHOR_RE.fullmatch(part.strip()):
-            buffer += part
-            posts.append(buffer)
-            buffer = ""
-        else:
-            buffer += part
-    return posts
 
 
 def _parse_posts(raw: str) -> list[str]:
-    """Очистка → разбиение → валидация."""
-    if not raw or len(raw) < 30:
+    if not raw or len(raw) < 50:
         logger.warning("Ответ модели слишком короткий (%d символов)", len(raw))
         return []
-
     raw = _clean_unicode(raw)
-    logger.info("После _clean_unicode: %d символов", len(raw))
 
-    if _DELIMITER.search(raw):
-        parts = _DELIMITER.split(raw)
-        logger.info("Разделитель ===POST=== сработал, частей: %d", len(parts))
-    else:
-        logger.warning("Разделитель не найден, anchor-fallback")
-        parts = _split_by_anchors(raw)
-        logger.info("Anchor-fallback вернул частей: %d", len(parts))
+    if not _DELIMITER.search(raw):
+        logger.warning("Разделитель ===POST=== не найден")
+        return []
+
+    parts = _DELIMITER.split(raw)
+    logger.info("Разделитель сработал, частей: %d", len(parts))
 
     posts: list[str] = []
     for i, part in enumerate(parts):
@@ -223,15 +181,14 @@ def _parse_posts(raw: str) -> list[str]:
             posts.append(cleaned)
         elif cleaned:
             logger.warning(
-                "Пост #%d отклонён (len=%d): %r",
-                i, len(cleaned), cleaned[:100],
+                "Пост #%d отклонён (len=%d, кириллица=%.0f%%): %r",
+                i, len(cleaned), _cyrillic_ratio(cleaned) * 100,
+                cleaned[:100],
             )
-
     return posts
 
 
 async def summarize_news(articles: list[dict]) -> list[str]:
-    """Превращает новости в готовые посты через OpenRouter."""
     if not articles:
         return []
 
@@ -254,30 +211,10 @@ async def summarize_news(articles: list[dict]) -> list[str]:
                 temperature=0.3,
                 max_tokens=4096,
             )
-
-            # --- Диагностика: finish_reason и usage ---
             choice = response.choices[0]
             finish = getattr(choice, "finish_reason", "unknown")
-            usage = getattr(response, "usage", None)
-            if usage:
-                logger.info(
-                    "usage: prompt=%s, completion=%s, total=%s, finish=%s",
-                    getattr(usage, "prompt_tokens", "?"),
-                    getattr(usage, "completion_tokens", "?"),
-                    getattr(usage, "total_tokens", "?"),
-                    finish,
-                )
-            else:
-                logger.info("finish_reason=%s (usage отсутствует)", finish)
-
             raw = choice.message.content or ""
-            logger.info("Сырой ответ (%d символов):\n%s", len(raw), raw[:800])
-
-            if finish == "length":
-                logger.error(
-                    "Модель %s упёрлась в max_tokens — увеличь лимит "
-                    "или сократи входные данные", model,
-                )
+            logger.info("Сырой ответ (%d символов, finish=%s)", len(raw), finish)
 
             posts = _parse_posts(raw)
             if posts:
@@ -289,5 +226,5 @@ async def summarize_news(articles: list[dict]) -> list[str]:
         except Exception as exc:
             logger.error("Ошибка модели %s: %s", model, exc, exc_info=True)
 
-    logger.error("Все модели недоступны, посты не сгенерированы")
-    return []
+    logger.error("Все модели недоступны или вернули невалидные посты")
+    return []2
