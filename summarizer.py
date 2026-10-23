@@ -1,8 +1,8 @@
 """
 Суммаризация новостей о смартфонах через OpenRouter.
 
-SYSTEM_PROMPT написан на английском для лучшего следования инструкциям,
-но с жёстким требованием: OUTPUT MUST BE IN RUSSIAN.
+Формат: заголовок <b>, текст, ссылка в виде <a href="URL">Источник</a>.
+Жёсткая языковая валидация: кириллицы >= 40%.
 """
 import logging
 import re
@@ -35,13 +35,9 @@ OUTPUT LANGUAGE: RUSSIAN ONLY.
 - Do NOT output English sentences. Do NOT mix languages.
 - Brand names and model names (iPhone 17 Pro, Samsung Galaxy S25,
   Xiaomi 15 Ultra, Pixel 9) MAY stay in Latin script.
-- Everything else — headlines, descriptions, verbs, adjectives,
-  numbers-as-words — MUST be in Russian Cyrillic.
-- If you are unsure how to translate a word, use a Russian
-  equivalent or transliteration, never leave it in English.
+- Everything else MUST be in Russian Cyrillic.
 
-A post written in English will be automatically REJECTED
-and not published. There is no reward for English output.
+A post written in English will be automatically REJECTED.
 
 ═══════════════════════════════════════════════════════════
 YOUR TASK
@@ -66,7 +62,7 @@ IGNORE (do not create posts for):
 - Software (unless directly about a smartphone feature)
 
 If fewer than 3 items match the topic, produce as many as you can.
-NEVER pad the list with off-topic news just to reach 5 posts.
+NEVER pad the list with off-topic news.
 
 ═══════════════════════════════════════════════════════════
 FORMAT REQUIREMENTS (per post, all fields in RUSSIAN)
@@ -74,12 +70,13 @@ FORMAT REQUIREMENTS (per post, all fields in RUSSIAN)
 1. First line: one emoji + space + bold headline wrapped in <b>...</b>
    - Headline: RUSSIAN, max 80 characters
    - Emoji stays OUTSIDE the <b> tag
-2. Second line: empty line (blank separator)
+2. Second line: empty line
 3. Then 2–3 sentences IN RUSSIAN with facts, numbers, model names
-4. Last line: bare URL (raw link, no wrapper)
-   - Do NOT wrap URL in <a href="...">
-   - Do NOT add the word "Источник" or any label
-   - Do NOT put the URL in brackets
+4. Last line: clickable link with the label "Источник"
+   - Exact format: <a href="URL">Источник</a>
+   - The label MUST be the Russian word "Источник"
+   - Do NOT use bare URLs
+   - Do NOT use other labels ("Source", "Ссылка", "Читать")
 5. Total post length: up to 600 characters
 6. Tone: neutral, informative, no clickbait
 
@@ -88,7 +85,6 @@ OUTPUT FORMAT
 ═══════════════════════════════════════════════════════════
 Posts are separated by the exact line: ===POST===
 Do NOT output JSON, markdown, numbering, or explanations.
-Start directly with the first post.
 
 ═══════════════════════════════════════════════════════════
 ✅ CORRECT EXAMPLE (study the language and format)
@@ -100,7 +96,7 @@ Start directly with the first post.
 
 Прошивка добавляет новые функции камеры и улучшенную работу ИИ-ассистента. Обновление уже распространяется в Европе, в России ожидается до конца ноября.
 
-https://example.com/article-1
+<a href="https://example.com/article-1">Источник</a>
 
 ===POST===
 
@@ -108,20 +104,21 @@ https://example.com/article-1
 
 Смартфон получил процессор Snapdragon 7s Gen 3, батарею 5500 мА·ч и 200-мегапиксельную камеру. Старт продаж — 15 ноября 2026 года.
 
-https://example.com/article-2
+<a href="https://example.com/article-2">Источник</a>
 
 ═══════════════════════════════════════════════════════════
 ❌ FORBIDDEN
 ═══════════════════════════════════════════════════════════
 - Writing posts in English (or any language other than Russian)
 - Using **markdown bold** instead of <b>...</b>
-- Wrapping the URL in <a href="...">
-- Adding "Источник", "Source", or any label before the URL
+- Bare URLs without <a href="...">Источник</a> wrapper
+- Using any label other than "Источник" for the link
 - Mixing English and Russian in body text
 - Adding comments before, between, or after posts
 - Inventing URLs — use ONLY URLs from the input data
 
-Remember: OUTPUT MUST BE IN RUSSIAN. Non-Russian posts are rejected.
+Remember: OUTPUT MUST BE IN RUSSIAN, and the link MUST be
+<a href="URL">Источник</a>.
 """
 
 
@@ -137,31 +134,49 @@ def _clean_unicode(text: str) -> str:
     return text
 
 
+def _normalize_source_link(text: str) -> str:
+    """
+    Приводит ссылку в конце поста к виду <a href="URL">Источник</a>.
+
+    - Если уже есть <a href="URL">...</a> — заменяет label на «Источник».
+    - Если голый URL в конце — оборачивает его в <a href>Источник</a>.
+    """
+    # 1) Нормализуем существующий <a href="...">label</a>
+    text = re.sub(
+        r'<a\s+href="([^"]+)"[^>]*>[^<]*</a>',
+        r'<a href="\1">Источник</a>',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 2) Если <a href> нет, оборачиваем последний голый URL
+    if "<a href=" not in text.lower():
+        matches = list(re.finditer(r'https?://[^\s<>"\']+', text))
+        if matches:
+            last = matches[-1]
+            url = last.group(0).rstrip(".,;:)")
+            before = text[:last.start()]
+            after = text[last.end():]
+            text = before + f'<a href="{url}">Источник</a>' + after
+
+    return text
+
+
 def _clean_post(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```[\w]*\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
 
-    # <a href="URL">текст</a> → голый URL
-    text = re.sub(
-        r'<a\s+href="([^"]+)"[^>]*>[^<]*</a>',
-        r"\1",
-        text,
-        flags=re.IGNORECASE,
-    )
-
     # **жирный** → <b>жирный</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
 
-    # Убираем случайный префикс "Источник: " перед голым URL
-    text = re.sub(
-        r"(?i)(источник|source)\s*:\s*(https?://)",
-        r"\2",
-        text,
-    )
+    # Убираем возможный префикс «Источник: » перед голым URL
+    text = re.sub(r"(?i)(источник|source)\s*:\s*(https?://)", r"\2", text)
 
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+
+    text = _normalize_source_link(text)
     return text.strip()
 
 
@@ -183,14 +198,6 @@ def _cyrillic_ratio(text: str) -> float:
 
 
 def _is_valid_post(text: str, max_len: int = 600) -> bool:
-    """
-    Пост валиден, если:
-    - начинается с эмодзи
-    - содержит <b>...</b> (заголовок)
-    - содержит голый URL
-    - кириллицы >= 40%
-    - длина <= max_len
-    """
     if not text or len(text) > max_len:
         return False
     stripped = text.strip()
@@ -198,7 +205,9 @@ def _is_valid_post(text: str, max_len: int = 600) -> bool:
         return False
     if "<b>" not in stripped:
         return False
-    if not re.search(r"https?://", stripped):
+    if '<a href=' not in stripped.lower():
+        return False
+    if "Источник" not in stripped:
         return False
 
     ratio = _cyrillic_ratio(stripped)
