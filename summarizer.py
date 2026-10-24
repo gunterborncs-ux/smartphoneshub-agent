@@ -1,19 +1,22 @@
 """
 Суммаризация новостей о смартфонах через OpenRouter.
 
-Формат: заголовок <b>, текст, ссылка в виде <a href="URL">Источник</a>.
-Жёсткая языковая валидация: кириллицы >= 40%.
+Ключевые особенности:
+- Цепочка моделей MODELS_CHAIN: перебор при 404/429/timeout/пустом ответе
+- reasoning.enabled=false: бюджет max_tokens идёт на ответ, а не на «размышления»
+- max_tokens=8192: с запасом на длинный ответ
+- Если модель не поддерживает reasoning-параметр — автоматический повтор без него
 """
 import logging
 import re
 
+import openai
 from openai import AsyncOpenAI
 
 from config import (
     OPENROUTER_KEY,
     OPENROUTER_BASE,
-    PRIMARY_MODEL,
-    FALLBACK_MODEL,
+    MODELS_CHAIN,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,6 +125,8 @@ Remember: OUTPUT MUST BE IN RUSSIAN, and the link MUST be
 """
 
 
+# ---------- Утилиты очистки ----------
+
 def _clean_unicode(text: str) -> str:
     if not text:
         return text
@@ -135,21 +140,13 @@ def _clean_unicode(text: str) -> str:
 
 
 def _normalize_source_link(text: str) -> str:
-    """
-    Приводит ссылку в конце поста к виду <a href="URL">Источник</a>.
-
-    - Если уже есть <a href="URL">...</a> — заменяет label на «Источник».
-    - Если голый URL в конце — оборачивает его в <a href>Источник</a>.
-    """
-    # 1) Нормализуем существующий <a href="...">label</a>
+    """Приводит ссылку в конце поста к <a href="URL">Источник</a>."""
     text = re.sub(
         r'<a\s+href="([^"]+)"[^>]*>[^<]*</a>',
         r'<a href="\1">Источник</a>',
         text,
         flags=re.IGNORECASE,
     )
-
-    # 2) Если <a href> нет, оборачиваем последний голый URL
     if "<a href=" not in text.lower():
         matches = list(re.finditer(r'https?://[^\s<>"\']+', text))
         if matches:
@@ -158,7 +155,6 @@ def _normalize_source_link(text: str) -> str:
             before = text[:last.start()]
             after = text[last.end():]
             text = before + f'<a href="{url}">Источник</a>' + after
-
     return text
 
 
@@ -166,16 +162,10 @@ def _clean_post(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```[\w]*\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
-
-    # **жирный** → <b>жирный</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-
-    # Убираем возможный префикс «Источник: » перед голым URL
     text = re.sub(r"(?i)(источник|source)\s*:\s*(https?://)", r"\2", text)
-
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-
     text = _normalize_source_link(text)
     return text.strip()
 
@@ -209,13 +199,7 @@ def _is_valid_post(text: str, max_len: int = 600) -> bool:
         return False
     if "Источник" not in stripped:
         return False
-
-    ratio = _cyrillic_ratio(stripped)
-    if ratio < 0.40:
-        logger.warning(
-            "Пост отклонён: кириллицы %.0f%% (<40%%). Начало: %r",
-            ratio * 100, stripped[:100],
-        )
+    if _cyrillic_ratio(stripped) < 0.40:
         return False
     return True
 
@@ -250,7 +234,92 @@ def _parse_posts(raw: str) -> list[str]:
     return posts
 
 
+# ---------- Запрос к одной модели ----------
+
+async def _try_model(
+    model: str,
+    news_text: str,
+    use_reasoning_off: bool,
+) -> str | None:
+    """
+    Один запрос к модели. Возвращает content или None,
+    если модель недоступна / вернула пустой ответ.
+    """
+    kwargs = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": news_text},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 8192,
+    }
+    if use_reasoning_off:
+        kwargs["extra_body"] = {"reasoning": {"enabled": False}}
+
+    try:
+        logger.info(
+            "[LLM] %s (reasoning=%s)",
+            model, "off" if use_reasoning_off else "default",
+        )
+        response = await _client.chat.completions.create(**kwargs)
+    except openai.BadRequestError as exc:
+        if use_reasoning_off:
+            logger.warning(
+                "[LLM] %s: reasoning-параметр отклонён (%s), повтор без него",
+                model, exc,
+            )
+            return await _try_model(model, news_text, use_reasoning_off=False)
+        logger.error("[LLM] %s: BadRequest: %s", model, exc)
+        return None
+    except openai.NotFoundError as exc:
+        logger.error("[LLM] %s: 404 Not Found — %s", model, exc)
+        return None
+    except openai.RateLimitError as exc:
+        logger.warning("[LLM] %s: 429 rate limit — %s", model, exc)
+        return None
+    except openai.APIError as exc:
+        logger.error("[LLM] %s: API error — %s", model, exc)
+        return None
+
+    choice = response.choices[0]
+    finish = getattr(choice, "finish_reason", "unknown")
+    content = (choice.message.content or "").strip()
+
+    usage = getattr(response, "usage", None)
+    if usage:
+        logger.info(
+            "[LLM] %s: finish=%s, prompt=%s, completion=%s, total=%s",
+            model, finish,
+            getattr(usage, "prompt_tokens", "?"),
+            getattr(usage, "completion_tokens", "?"),
+            getattr(usage, "total_tokens", "?"),
+        )
+
+    if finish == "length" and not content:
+        logger.warning(
+            "[LLM] %s: finish=length + пустой content — "
+            "модель израсходовала max_tokens на reasoning. "
+            "Пробую следующую модель.",
+            model,
+        )
+        return None
+
+    if not content:
+        logger.warning("[LLM] %s: пустой content (finish=%s)", model, finish)
+        return None
+
+    logger.info("[LLM] %s: OK, %d символов", model, len(content))
+    return content
+
+
+# ---------- Публичная функция ----------
+
 async def summarize_news(articles: list[dict]) -> list[str]:
+    """
+    Перебирает MODELS_CHAIN: 404, 429, timeout, пустой ответ
+    или finish=length с пустым content → переходит к следующей модели.
+    """
     if not articles:
         return []
 
@@ -261,32 +330,20 @@ async def summarize_news(articles: list[dict]) -> list[str]:
         for a in articles[:30]
     )
 
-    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
-        try:
-            logger.info("Запрос к модели: %s", model)
-            response = await _client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": news_text},
-                ],
-                temperature=0.3,
-                max_tokens=4096,
-            )
-            choice = response.choices[0]
-            finish = getattr(choice, "finish_reason", "unknown")
-            raw = choice.message.content or ""
-            logger.info("Сырой ответ (%d символов, finish=%s)", len(raw), finish)
+    for model in MODELS_CHAIN:
+        raw = await _try_model(model, news_text, use_reasoning_off=True)
+        if not raw:
+            continue
 
-            posts = _parse_posts(raw)
-            if posts:
-                logger.info("Модель %s: валидных постов %d", model, len(posts))
-                return posts
+        posts = _parse_posts(raw)
+        if posts:
+            logger.info("[LLM] %s: валидных постов %d", model, len(posts))
+            return posts
 
-            logger.warning("Модель %s: ни один пост не прошёл валидацию", model)
-
-        except Exception as exc:
-            logger.error("Ошибка модели %s: %s", model, exc, exc_info=True)
+        logger.warning(
+            "[LLM] %s: ответ есть (%d символов), но постов не получилось",
+            model, len(raw),
+        )
 
     logger.error("Все модели недоступны или вернули невалидные посты")
     return []
