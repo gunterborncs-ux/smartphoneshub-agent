@@ -1,11 +1,10 @@
 """
 Суммаризация новостей о смартфонах через OpenRouter.
 
-Ключевые особенности:
-- Цепочка моделей MODELS_CHAIN: перебор при 404/429/timeout/пустом ответе
-- reasoning.enabled=false: бюджет max_tokens идёт на ответ, а не на «размышления»
-- max_tokens=8192: с запасом на длинный ответ
-- Если модель не поддерживает reasoning-параметр — автоматический повтор без него
+Валидация:
+- Заголовок в <b>...</b> должен быть на русском (≥40% кириллицы)
+- Общий текст — тоже ≥40% кириллицы
+- Ссылка должна быть в <a href="URL">Источник</a>
 """
 import logging
 import re
@@ -29,18 +28,34 @@ _client = AsyncOpenAI(
 SYSTEM_PROMPT = """You are the editor of a Russian-language Telegram channel @smartphoneshub about smartphones.
 
 ═══════════════════════════════════════════════════════════
-🔴 CRITICAL LANGUAGE RULE — READ BEFORE ANYTHING ELSE 🔴
+🔴 TWO CRITICAL RULES — READ BEFORE ANYTHING ELSE 🔴
 ═══════════════════════════════════════════════════════════
-OUTPUT LANGUAGE: RUSSIAN ONLY.
 
-- Even if the input news is in English (or any other language),
-  you MUST translate it and write the post in RUSSIAN.
-- Do NOT output English sentences. Do NOT mix languages.
-- Brand names and model names (iPhone 17 Pro, Samsung Galaxy S25,
-  Xiaomi 15 Ultra, Pixel 9) MAY stay in Latin script.
-- Everything else MUST be in Russian Cyrillic.
+RULE 1. OUTPUT LANGUAGE: RUSSIAN ONLY.
+- Everything (headline, body) MUST be in Russian.
+- If input news is English — translate it.
+- Brand/model names (iPhone 17, Galaxy S25, Xiaomi 15) stay in Latin script.
 
-A post written in English will be automatically REJECTED.
+RULE 2. HEADLINE MUST BE IN RUSSIAN.
+- The <b>...</b> headline MUST be translated to Russian.
+- DO NOT copy the English source title verbatim into the headline.
+- A post with an English headline will be automatically REJECTED.
+
+═══════════════════════════════════════════════════════════
+⚠️ HEADLINE TRANSLATION EXAMPLES ⚠️
+═══════════════════════════════════════════════════════════
+
+Source: "iQOO Neo 12 Roundup: Everything you need to know before launch"
+❌ WRONG: <b>iQOO Neo 12 Roundup: Everything you need to know before launch</b>
+✅ CORRECT: <b>iQOO Neo 12: всё, что известно перед запуском</b>
+
+Source: "ColorOS 17 update rolls out early for these OnePlus and Oppo phones"
+❌ WRONG: <b>ColorOS 17 update rolls out early for these OnePlus and Oppo phones</b>
+✅ CORRECT: <b>ColorOS 17 начал распространяться раньше срока</b>
+
+Source: "Samsung Galaxy S25 Ultra gets One UI 7.1 update"
+❌ WRONG: <b>Samsung Galaxy S25 Ultra gets One UI 7.1 update</b>
+✅ CORRECT: <b>Samsung Galaxy S25 Ultra получил One UI 7.1</b>
 
 ═══════════════════════════════════════════════════════════
 YOUR TASK
@@ -54,7 +69,7 @@ TOPIC — SMARTPHONES ONLY:
 - Reviews, comparisons, benchmarks
 - Specs: chipset, camera, battery, display, price
 
-IGNORE (do not create posts for):
+IGNORE:
 - Headphones, earbuds, speakers, audio gear
 - Smartwatches, bands, wearables
 - Tablets, laptops, PCs
@@ -65,23 +80,19 @@ IGNORE (do not create posts for):
 - Software (unless directly about a smartphone feature)
 
 If fewer than 3 items match the topic, produce as many as you can.
-NEVER pad the list with off-topic news.
 
 ═══════════════════════════════════════════════════════════
-FORMAT REQUIREMENTS (per post, all fields in RUSSIAN)
+FORMAT REQUIREMENTS (per post)
 ═══════════════════════════════════════════════════════════
-1. First line: one emoji + space + bold headline wrapped in <b>...</b>
-   - Headline: RUSSIAN, max 80 characters
-   - Emoji stays OUTSIDE the <b> tag
-2. Second line: empty line
+1. First line: one emoji + space + bold headline in <b>...</b>
+   - Headline: RUSSIAN, max 80 chars
+   - Emoji stays OUTSIDE <b>
+2. Second line: empty
 3. Then 2–3 sentences IN RUSSIAN with facts, numbers, model names
-4. Last line: clickable link with the label "Источник"
-   - Exact format: <a href="URL">Источник</a>
-   - The label MUST be the Russian word "Источник"
+4. Last line: <a href="URL">Источник</a>
+   - Label MUST be exactly "Источник" (Russian word)
    - Do NOT use bare URLs
-   - Do NOT use other labels ("Source", "Ссылка", "Читать")
-5. Total post length: up to 600 characters
-6. Tone: neutral, informative, no clickbait
+5. Total post: up to 600 chars
 
 ═══════════════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -90,7 +101,7 @@ Posts are separated by the exact line: ===POST===
 Do NOT output JSON, markdown, numbering, or explanations.
 
 ═══════════════════════════════════════════════════════════
-✅ CORRECT EXAMPLE (study the language and format)
+✅ CORRECT EXAMPLE
 ═══════════════════════════════════════════════════════════
 
 ===POST===
@@ -112,16 +123,14 @@ Do NOT output JSON, markdown, numbering, or explanations.
 ═══════════════════════════════════════════════════════════
 ❌ FORBIDDEN
 ═══════════════════════════════════════════════════════════
-- Writing posts in English (or any language other than Russian)
-- Using **markdown bold** instead of <b>...</b>
+- English headline or body
+- Copying the English source title into <b>...</b>
+- **markdown bold** instead of <b>...</b>
 - Bare URLs without <a href="...">Источник</a> wrapper
-- Using any label other than "Источник" for the link
-- Mixing English and Russian in body text
-- Adding comments before, between, or after posts
-- Inventing URLs — use ONLY URLs from the input data
+- Any label other than "Источник" for the link
+- Inventing URLs — use ONLY URLs from the input
 
-Remember: OUTPUT MUST BE IN RUSSIAN, and the link MUST be
-<a href="URL">Источник</a>.
+Remember: HEADLINE IN RUSSIAN, link = <a href="URL">Источник</a>.
 """
 
 
@@ -140,9 +149,13 @@ def _clean_unicode(text: str) -> str:
 
 
 def _normalize_source_link(text: str) -> str:
-    """Приводит ссылку в конце поста к <a href="URL">Источник</a>."""
+    """
+    Приводит ссылку в конце поста к <a href="URL">Источник</a>.
+    Поддерживает и одинарные, и двойные кавычки, а также href=URL без кавычек.
+    """
+    # Универсальный regex для <a href=...>...</a>
     text = re.sub(
-        r'<a\s+href="([^"]+)"[^>]*>[^<]*</a>',
+        r'<a\s+href\s*=\s*["\']?([^"\'\s>]+)["\']?[^>]*>[^<]*</a>',
         r'<a href="\1">Источник</a>',
         text,
         flags=re.IGNORECASE,
@@ -187,19 +200,46 @@ def _cyrillic_ratio(text: str) -> float:
     return cyr / total if total else 0.0
 
 
+def _headline_is_russian(text: str) -> tuple[bool, str, float]:
+    """
+    Проверяет, что заголовок в <b>...</b> на русском.
+    Возвращает (ok, headline_text, cyrillic_ratio).
+    """
+    m = re.search(r'<b>(.+?)</b>', text, re.DOTALL)
+    if not m:
+        return False, "", 0.0
+    headline = m.group(1).strip()
+    ratio = _cyrillic_ratio(headline)
+    return ratio >= 0.40, headline, ratio
+
+
 def _is_valid_post(text: str, max_len: int = 600) -> bool:
     if not text or len(text) > max_len:
         return False
     stripped = text.strip()
     if not stripped or not _is_emoji(stripped[0]):
         return False
-    if "<b>" not in stripped:
+
+    # Заголовок в <b>...</b> должен быть на русском
+    headline_ok, headline, ratio = _headline_is_russian(stripped)
+    if not headline_ok:
+        logger.warning(
+            "Пост отклонён: заголовок на английском (кириллица %.0f%%): %r",
+            ratio * 100, headline[:100],
+        )
         return False
+
     if '<a href=' not in stripped.lower():
         return False
     if "Источник" not in stripped:
         return False
+
+    # Общая проверка кириллицы
     if _cyrillic_ratio(stripped) < 0.40:
+        logger.warning(
+            "Пост отклонён: кириллицы %.0f%% (<40%%): %r",
+            _cyrillic_ratio(stripped) * 100, stripped[:100],
+        )
         return False
     return True
 
@@ -227,9 +267,8 @@ def _parse_posts(raw: str) -> list[str]:
             posts.append(cleaned)
         elif cleaned:
             logger.warning(
-                "Пост #%d отклонён (len=%d, кириллица=%.0f%%): %r",
-                i, len(cleaned), _cyrillic_ratio(cleaned) * 100,
-                cleaned[:100],
+                "Пост #%d отклонён (len=%d): %r",
+                i, len(cleaned), cleaned[:150],
             )
     return posts
 
@@ -241,10 +280,6 @@ async def _try_model(
     news_text: str,
     use_reasoning_off: bool,
 ) -> str | None:
-    """
-    Один запрос к модели. Возвращает content или None,
-    если модель недоступна / вернула пустой ответ.
-    """
     kwargs = {
         "model": model,
         "messages": [
@@ -258,53 +293,32 @@ async def _try_model(
         kwargs["extra_body"] = {"reasoning": {"enabled": False}}
 
     try:
-        logger.info(
-            "[LLM] %s (reasoning=%s)",
-            model, "off" if use_reasoning_off else "default",
-        )
+        logger.info("[LLM] %s (reasoning=%s)", model,
+                    "off" if use_reasoning_off else "default")
         response = await _client.chat.completions.create(**kwargs)
     except openai.BadRequestError as exc:
         if use_reasoning_off:
-            logger.warning(
-                "[LLM] %s: reasoning-параметр отклонён (%s), повтор без него",
-                model, exc,
-            )
+            logger.warning("[LLM] %s: reasoning-параметр отклонён, повтор", model)
             return await _try_model(model, news_text, use_reasoning_off=False)
         logger.error("[LLM] %s: BadRequest: %s", model, exc)
         return None
     except openai.NotFoundError as exc:
-        logger.error("[LLM] %s: 404 Not Found — %s", model, exc)
+        logger.error("[LLM] %s: 404: %s", model, exc)
         return None
     except openai.RateLimitError as exc:
-        logger.warning("[LLM] %s: 429 rate limit — %s", model, exc)
+        logger.warning("[LLM] %s: 429: %s", model, exc)
         return None
     except openai.APIError as exc:
-        logger.error("[LLM] %s: API error — %s", model, exc)
+        logger.error("[LLM] %s: API error: %s", model, exc)
         return None
 
     choice = response.choices[0]
     finish = getattr(choice, "finish_reason", "unknown")
     content = (choice.message.content or "").strip()
 
-    usage = getattr(response, "usage", None)
-    if usage:
-        logger.info(
-            "[LLM] %s: finish=%s, prompt=%s, completion=%s, total=%s",
-            model, finish,
-            getattr(usage, "prompt_tokens", "?"),
-            getattr(usage, "completion_tokens", "?"),
-            getattr(usage, "total_tokens", "?"),
-        )
-
     if finish == "length" and not content:
-        logger.warning(
-            "[LLM] %s: finish=length + пустой content — "
-            "модель израсходовала max_tokens на reasoning. "
-            "Пробую следующую модель.",
-            model,
-        )
+        logger.warning("[LLM] %s: finish=length + пустой content", model)
         return None
-
     if not content:
         logger.warning("[LLM] %s: пустой content (finish=%s)", model, finish)
         return None
@@ -316,17 +330,15 @@ async def _try_model(
 # ---------- Публичная функция ----------
 
 async def summarize_news(articles: list[dict]) -> list[str]:
-    """
-    Перебирает MODELS_CHAIN: 404, 429, timeout, пустой ответ
-    или finish=length с пустым content → переходит к следующей модели.
-    """
     if not articles:
         return []
 
+    # Явно маркируем исходный title как «на английском, нужно перевести»
     news_text = "\n\n".join(
-        f"Заголовок: {a['title']}\n"
-        f"Описание: {a.get('summary', '')[:250]}\n"
-        f"Ссылка: {a['link']}"
+        f"ИСХОДНАЯ НОВОСТЬ (перевести на русский, заголовок тоже!):\n"
+        f"  Оригинальный заголовок: {a['title']}\n"
+        f"  Описание: {a.get('summary', '')[:250]}\n"
+        f"  Ссылка: {a['link']}"
         for a in articles[:30]
     )
 
