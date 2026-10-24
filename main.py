@@ -1,16 +1,17 @@
 """
 Smartphones News Agent.
 
-Медиа — ровно одно фото из HTML статьи (приоритет og:image).
-RSS — только источник заголовков и ссылок.
-Ссылка в посте — <a href="URL">Источник</a>.
+Фото берётся из HTML статьи (og:image / JSON-LD / первое <img>).
+Если HTML не дал фото (сайт блокирует GitHub Actions) и в config.py
+USE_RSS_MEDIA_FALLBACK=True — берём картинку из RSS (media:content).
+Ссылка — <a href="URL">Источник</a>.
 """
 import asyncio
 import json
 import logging
 import re
 import traceback
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import feedparser
@@ -27,6 +28,7 @@ from config import (
     HISTORY_FILE,
     POST_DELAY_SECONDS,
     HISTORY_RETENTION_DAYS,
+    USE_RSS_MEDIA_FALLBACK,
 )
 from dedup import deduplicate
 from rss_sources import RSS_FEEDS, BRAND_MARKERS, PHONE_KEYWORDS, STOP_WORDS
@@ -68,10 +70,9 @@ def _html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-# ---------- Одно фото из HTML ----------
+# ---------- Утилиты ----------
 
 def _is_valid_image_url(url: str) -> bool:
-    """Отсеивает мусор: пиксели, иконки, data-URL, SVG."""
     if not url or not isinstance(url, str):
         return False
     low = url.lower()
@@ -84,17 +85,30 @@ def _is_valid_image_url(url: str) -> bool:
     return True
 
 
+def _normalize_url_for_match(url: str) -> str:
+    """Нормализует URL для сравнения: без схемы, www, trailing slash, query."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url.lower().strip()
+    netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = parsed.path.rstrip("/")
+    return f"{netloc}{path}"
+
+
+# ---------- Фото из HTML ----------
+
 async def fetch_article_image(
     session: aiohttp.ClientSession, url: str,
 ) -> str | None:
     """
-    Загружает HTML статьи и возвращает ОДНО изображение.
-
-    Приоритет:
-      1. og:image
-      2. twitter:image
-      3. JSON-LD image
-      4. Первое достаточно крупное <img> из <article>/<main>
+    Загружает HTML статьи и возвращает ОДНО фото.
+    Приоритет: og:image → twitter:image → JSON-LD → первое <img>.
+    Логирует HTTP-статус для диагностики.
     """
     try:
         async with session.get(
@@ -107,36 +121,45 @@ async def fetch_article_image(
             },
         ) as resp:
             if resp.status != 200:
-                logger.warning("HTML %s → статус %s", url, resp.status)
+                logger.warning(
+                    "[HTML] %s → HTTP %s (возможно, сайт блокирует GitHub Actions)",
+                    url, resp.status,
+                )
                 return None
             html = await resp.text(errors="ignore")
+    except asyncio.TimeoutError:
+        logger.warning("[HTML] %s → timeout", url)
+        return None
     except Exception as exc:
-        logger.warning("Не удалось загрузить статью %s: %s", url, exc)
+        logger.warning("[HTML] %s → ошибка: %s", url, exc)
         return None
 
+    logger.info("[HTML] %s → %d символов", url, len(html))
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) og:image
+    # 1. og:image
     for tag in soup.find_all("meta"):
         prop = (tag.get("property") or tag.get("name") or "").lower()
         if prop in ("og:image", "og:image:url", "og:image:secure_url"):
-            content = tag.get("content", "")
+            content = tag.get("content", "").strip()
             if content:
-                abs_url = urljoin(url, content.strip())
+                abs_url = urljoin(url, content)
                 if _is_valid_image_url(abs_url):
+                    logger.info("[HTML] %s → og:image: %s", url, abs_url[:100])
                     return abs_url
 
-    # 2) twitter:image
+    # 2. twitter:image
     for tag in soup.find_all("meta"):
         prop = (tag.get("property") or tag.get("name") or "").lower()
         if prop in ("twitter:image", "twitter:image:src"):
-            content = tag.get("content", "")
+            content = tag.get("content", "").strip()
             if content:
-                abs_url = urljoin(url, content.strip())
+                abs_url = urljoin(url, content)
                 if _is_valid_image_url(abs_url):
+                    logger.info("[HTML] %s → twitter:image: %s", url, abs_url[:100])
                     return abs_url
 
-    # 3) JSON-LD
+    # 3. JSON-LD
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
         try:
             data = json.loads(script.string or "")
@@ -158,13 +181,13 @@ async def fetch_article_image(
                         candidates.append(x["url"])
             elif isinstance(img, dict) and img.get("url"):
                 candidates = [img["url"]]
-
             for c in candidates:
                 abs_url = urljoin(url, c.strip())
                 if _is_valid_image_url(abs_url):
+                    logger.info("[HTML] %s → JSON-LD: %s", url, abs_url[:100])
                     return abs_url
 
-    # 4) Первое <img> в <article>/<main>
+    # 4. Первое достаточно крупное <img>
     containers = soup.find_all("article") or soup.find_all("main") or []
     for container in containers:
         for img in container.find_all("img"):
@@ -176,7 +199,6 @@ async def fetch_article_image(
                     continue
             except (ValueError, TypeError):
                 pass
-
             src = (
                 img.get("src")
                 or img.get("data-src")
@@ -187,23 +209,52 @@ async def fetch_article_image(
                 srcset = img.get("srcset") or img.get("data-srcset") or ""
                 if srcset:
                     candidates = [
-                        part.strip().split(" ")
-                        for part in srcset.split(",")
-                        if part.strip()
+                        p.strip().split(" ")
+                        for p in srcset.split(",")
+                        if p.strip()
                     ]
                     if candidates:
                         src = candidates[-1][0]
-
             if not src:
                 continue
             abs_url = urljoin(url, src.strip())
             if _is_valid_image_url(abs_url):
+                logger.info("[HTML] %s → <img>: %s", url, abs_url[:100])
                 return abs_url
 
+    logger.warning("[HTML] %s → фото не найдено", url)
     return None
 
 
-# ---------- RSS (только заголовки и ссылки) ----------
+# ---------- RSS (заголовки, ссылки, медиа для fallback) ----------
+
+def _extract_rss_images(entry: dict) -> list[str]:
+    """Собирает фото из media_content, media_thumbnail, enclosures."""
+    images: list[str] = []
+    seen: set[str] = set()
+
+    def _add(url: str) -> None:
+        if url and url not in seen:
+            seen.add(url)
+            images.append(url)
+
+    for mc in (entry.get("media_content") or []):
+        url = mc.get("url", "")
+        mtype = mc.get("type", "")
+        if url and (mtype.startswith("image/") or not mtype):
+            _add(url)
+
+    for mt in (entry.get("media_thumbnail") or []):
+        _add(mt.get("url", ""))
+
+    for enc in (entry.get("enclosures") or []):
+        url = enc.get("href") or enc.get("url", "")
+        mtype = enc.get("type", "")
+        if url and mtype.startswith("image/"):
+            _add(url)
+
+    return images
+
 
 async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
     try:
@@ -220,6 +271,7 @@ async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
                 "title": title,
                 "link": link,
                 "summary": (entry.get("summary") or "").strip(),
+                "rss_images": _extract_rss_images(entry),
             })
         return articles
     except Exception as exc:
@@ -252,19 +304,26 @@ async def collect_all_news() -> list[dict]:
 # ---------- Матчинг пост → статья ----------
 
 def _match_article(post: str, articles: list[dict]) -> dict | None:
+    """Ищет статью по URL из <a href> с несколькими уровнями нормализации."""
     hrefs = set(_HREF_RE.findall(post))
     if not hrefs:
         return None
+
+    # 1. Точный match
     for article in articles:
         if article.get("link") in hrefs:
             return article
+
+    # 2. Нормализованный match (без схемы, www, trailing slash)
+    post_norms = {_normalize_url_for_match(u) for u in hrefs}
     for article in articles:
-        norm = (article.get("link") or "").rstrip("/")
-        if not norm:
-            continue
-        for url in hrefs:
-            if url.rstrip("/") == norm:
-                return article
+        if _normalize_url_for_match(article.get("link", "")) in post_norms:
+            return article
+
+    logger.warning(
+        "Статья не найдена по URL. hrefs=%s, articles=%d",
+        list(hrefs)[:3], len(articles),
+    )
     return None
 
 
@@ -291,7 +350,7 @@ async def notify_admin(bot: Bot, reason: str, details: str = "") -> None:
 async def _send_single_post(
     bot: Bot, post: str, image: str | None,
 ) -> bool:
-    """Одно фото (sendPhoto) → текст (sendMessage)."""
+    """Фото → текст."""
     if image:
         try:
             await bot.send_photo(
@@ -303,7 +362,10 @@ async def _send_single_post(
             logger.info("Пост с фото: %s...", post[:60])
             return True
         except Exception as exc:
-            logger.warning("Фото не отправилось, fallback на текст: %s", exc)
+            logger.warning(
+                "send_photo не удалось (%s). URL фото: %s",
+                exc, image[:120],
+            )
 
     try:
         await bot.send_message(
@@ -320,24 +382,41 @@ async def _send_single_post(
 async def publish_posts(
     bot: Bot, posts: list[str], articles: list[dict],
 ) -> list[str]:
-    """Для каждого поста загружает HTML и берёт ОДНО фото оттуда."""
+    """
+    Приоритет фото:
+      1. og:image из HTML
+      2. Если HTML не дал и USE_RSS_MEDIA_FALLBACK=True — первое фото из RSS
+    """
     published: list[str] = []
     async with aiohttp.ClientSession() as session:
         for post in posts:
             article = _match_article(post, articles)
             image: str | None = None
+            source = "none"
 
             if article:
-                logger.info("Загружаю HTML статьи %s", article["link"])
                 image = await fetch_article_image(session, article["link"])
                 if image:
-                    logger.info("Из HTML извлечено фото: %s", image[:120])
-                else:
-                    logger.warning("HTML не дал фото: %s", article["link"])
+                    source = "HTML"
+
+                if not image and USE_RSS_MEDIA_FALLBACK:
+                    rss_images = article.get("rss_images", [])
+                    if rss_images:
+                        image = rss_images[0]
+                        source = "RSS-fallback"
+                        logger.info(
+                            "[MEDIA] HTML не дал → RSS-fallback: %s",
+                            image[:100],
+                        )
             else:
                 logger.warning(
-                    "Не удалось сопоставить пост со статьёй — публикую без фото",
+                    "Статья не сопоставлена — фото не будет",
                 )
+
+            logger.info(
+                "[MEDIA] итог: source=%s, image=%s",
+                source, (image[:80] + "...") if image else "None",
+            )
 
             if await _send_single_post(bot, post, image):
                 published.append(post)
