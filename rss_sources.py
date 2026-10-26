@@ -4,31 +4,15 @@
 """
 
 RSS_FEEDS = [
-    # iXBT — крупнейшее технологическое СМИ
     "https://www.ixbt.com/export/news/rss.xml",
-    # 4PDA — мобильные устройства и технологии
     "https://4pda.to/feed/",
-    # Hi-News — новости высоких технологий
     "https://hi-news.ru/feed",
-    # 3DNews — новости Hardware и Software
     "https://3dnews.ru/news/rss/",
-    # Mobile-review — обзоры мобильной техники
     "https://mobile-review.com/rss/news.xml",
-    # Ferra — гаджеты и технологии
     "https://www.ferra.ru/export/news.xml",
-    # AndroidInsider — всё об Android
     "https://androidinsider.ru/feed",
-
-    # --- Новые источники по запросу ---
-    # Rozetked — RSS подтверждён
     "https://rozetked.me/rss.xml",
-    # DNS Club (Клуб DNS) — раздел новостей DNS
-    # Если лента не работает, проверьте альтернативный адрес:
-    # https://club.dns-shop.ru/rss/ или https://club.dns-shop.ru/feed/
     "https://club.dns-shop.ru/rss/",
-    # Wylsacom — сайт Wylsa.com
-    # Если лента не работает, проверьте альтернативный адрес:
-    # https://wylsa.com/rss/ или https://wylsa.com/feed/
     "https://wylsa.com/feed/",
 ]
 
@@ -61,28 +45,24 @@ PHONE_KEYWORDS = [
 ]
 
 STOP_WORDS = [
-    # ============ АУДИО ============
+    # АУДИО
     "headphone", "headphones", "earbuds", "earbud", "earphone",
     "tws", "airpods", "speaker", "soundbar",
     "наушники", "гарнитура", "колонка", "аудиосистема",
-
-    # ============ НОСИМЫЕ ============
+    # НОСИМЫЕ
     "smartwatch", "apple watch", "galaxy watch", "fitness tracker",
     "умные часы", "фитнес-браслет", "mi band", "smart band",
-
-    # ============ КОМПЬЮТЕРЫ ============
+    # КОМПЬЮТЕРЫ
     "tablet", "ipad", "laptop", "notebook", "macbook", "chromebook",
     "планшет", "ноутбук", "макбук", "компьютер", "системный блок",
     "монитор", "клавиатура", "мышь компьютерная",
-
-    # ============ САНТЕХНИКА ============
+    # САНТЕХНИКА
     "душ", "shower", "душевой", "лейка душа", "душевая кабина",
     "ванна", "bathroom", "bath tub",
     "унитаз", "toilet", "биде", "bidet",
     "кран", "faucet", "смеситель", "смесител для",
     "раковина", "умывальник",
-
-    # ============ КУХОННАЯ ТЕХНИКА ============
+    # КУХОННАЯ ТЕХНИКА
     "стиральн машин", "washing machine",
     "посудомоечн", "dishwasher",
     "холодильник", "refrigerator", "fridge",
@@ -94,42 +74,34 @@ STOP_WORDS = [
     "аэрогриль", "air fryer", "духовк", "духовой шкаф", "oven",
     "плита", "варочная панель", "stove", "cooktop",
     "соковыжималк", "juicer",
-
-    # ============ БЫТОВАЯ ТЕХНИКА ============
+    # БЫТОВАЯ ТЕХНИКА
     "утюг", "iron для", "отпаривател",
     "фен", "hairdryer", "hair dryer",
     "зубная щетк", "electric toothbrush",
     "бритв", "razor", "электробритв",
     "массажер", "massager", "массажн",
-
-    # ============ КЛИМАТ ============
+    # КЛИМАТ
     "обогревател", "heater", "кондиционер", "air conditioner",
     "вентилятор", "fan комнатный",
     "очистител воздуха", "air purifier",
     "увлажнител", "humidifier", "мойка воздуха",
-
-    # ============ ОСВЕЩЕНИЕ / ЭЛЕКТРИКА ============
+    # ОСВЕЩЕНИЕ
     "светильник", "умная лампочк", "light bulb",
     "розетк", "smart plug", "умная розетка",
     "выключател", "smart switch",
-
-    # ============ БЕЗОПАСНОСТЬ / УМНЫЙ ДОМ ============
+    # БЕЗОПАСНОСТЬ
     "camera видеонаблюден", "security camera", "видеонаблюден",
     "дверной звонок", "doorbell", "умный звонок",
     "умный замок", "smart lock",
-
-    # ============ ПЫЛЕСОСЫ / РОБОТЫ ============
+    # ПЫЛЕСОСЫ
     "робот-пылесос", "robot vacuum", "пылесос", "vacuum cleaner",
-
-    # ============ ТВ / КОНСОЛИ ============
+    # ТВ / КОНСОЛИ
     "телевизор", "television", "playstation", "xbox",
     "nintendo switch", "игровая консоль",
-
-    # ============ АВТО ============
+    # АВТО
     "android auto", "carplay", "электромобил", "автомобил",
     "автопилот для авто",
-
-    # ============ ТАРИФЫ / ФИНАНСЫ ============
+    # ТАРИФЫ
     "тариф", "tariff", "подписк", "subscription",
     "оператор связи", "carrier plan",
 ]
