@@ -1,24 +1,35 @@
 """
 Источники RSS и правила фильтрации для смартфонов.
-
-STOP_WORDS расширены: бытовая техника, сантехника, кухонная техника,
-климатическая техника, товары для дома. Опасные слова ("camera", "watch",
-"band", "pc") заменены на явные фразы, чтобы не отсекать валидные
-посты про смартфоны.
+Только российские сайты.
 """
 
 RSS_FEEDS = [
-    "https://www.gsmarena.com/rss-news-reviews.php",
-    "https://www.theverge.com/rss/index.xml",
-    "https://techcrunch.com/category/mobile/feed/",
-    "https://www.androidauthority.com/feed/",
-    "https://9to5google.com/feed/",
-    "https://www.phonearena.com/news/rss",
-    "https://www.gizmochina.com/feed/",
-    "https://www.xda-developers.com/feed/",
-    "https://www.ixbt.com/export/news.rss",
-    "https://mobile-review.com/feed/",
+    # iXBT — крупнейшее технологическое СМИ
+    "https://www.ixbt.com/export/news/rss.xml",
+    # 4PDA — мобильные устройства и технологии
     "https://4pda.to/feed/",
+    # Hi-News — новости высоких технологий
+    "https://hi-news.ru/feed",
+    # 3DNews — новости Hardware и Software
+    "https://3dnews.ru/news/rss/",
+    # Mobile-review — обзоры мобильной техники
+    "https://mobile-review.com/rss/news.xml",
+    # Ferra — гаджеты и технологии
+    "https://www.ferra.ru/export/news.xml",
+    # AndroidInsider — всё об Android
+    "https://androidinsider.ru/feed",
+
+    # --- Новые источники по запросу ---
+    # Rozetked — RSS подтверждён
+    "https://rozetked.me/rss.xml",
+    # DNS Club (Клуб DNS) — раздел новостей DNS
+    # Если лента не работает, проверьте альтернативный адрес:
+    # https://club.dns-shop.ru/rss/ или https://club.dns-shop.ru/feed/
+    "https://club.dns-shop.ru/rss/",
+    # Wylsacom — сайт Wylsa.com
+    # Если лента не работает, проверьте альтернативный адрес:
+    # https://wylsa.com/rss/ или https://wylsa.com/feed/
+    "https://wylsa.com/feed/",
 ]
 
 BRAND_MARKERS = [
