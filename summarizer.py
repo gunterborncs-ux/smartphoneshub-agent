@@ -38,7 +38,7 @@ RULE 1. OUTPUT LANGUAGE: RUSSIAN ONLY.
 
 RULE 2. HEADLINE MUST BE IN RUSSIAN.
 - The <b>...</b> headline MUST be translated to Russian.
-- DO NOT copy the English source title verbatim into the headline.
+- DO NOT copy the source title verbatim into the headline.
 - A post with an English headline will be automatically REJECTED.
 
 ═══════════════════════════════════════════════════════════
@@ -48,10 +48,6 @@ RULE 2. HEADLINE MUST BE IN RUSSIAN.
 Source: "iQOO Neo 12 Roundup: Everything you need to know before launch"
 ❌ WRONG: <b>iQOO Neo 12 Roundup: Everything you need to know before launch</b>
 ✅ CORRECT: <b>iQOO Neo 12: всё, что известно перед запуском</b>
-
-Source: "ColorOS 17 update rolls out early for these OnePlus and Oppo phones"
-❌ WRONG: <b>ColorOS 17 update rolls out early for these OnePlus and Oppo phones</b>
-✅ CORRECT: <b>ColorOS 17 начал распространяться раньше срока</b>
 
 Source: "Samsung Galaxy S25 Ultra gets One UI 7.1 update"
 ❌ WRONG: <b>Samsung Galaxy S25 Ultra gets One UI 7.1 update</b>
@@ -69,7 +65,7 @@ TOPIC — SMARTPHONES ONLY:
 - Reviews, comparisons, benchmarks
 - Specs: chipset, camera, battery, display, price
 
-IGNORE:
+IGNORE (do not create posts for):
 - Headphones, earbuds, speakers, audio gear
 - Smartwatches, bands, wearables
 - Tablets, laptops, PCs
@@ -80,6 +76,7 @@ IGNORE:
 - Software (unless directly about a smartphone feature)
 
 If fewer than 3 items match the topic, produce as many as you can.
+NEVER pad the list with off-topic news.
 
 ═══════════════════════════════════════════════════════════
 FORMAT REQUIREMENTS (per post)
@@ -124,7 +121,7 @@ Do NOT output JSON, markdown, numbering, or explanations.
 ❌ FORBIDDEN
 ═══════════════════════════════════════════════════════════
 - English headline or body
-- Copying the English source title into <b>...</b>
+- Copying the source title into <b>...</b>
 - **markdown bold** instead of <b>...</b>
 - Bare URLs without <a href="...">Источник</a> wrapper
 - Any label other than "Источник" for the link
@@ -133,8 +130,6 @@ Do NOT output JSON, markdown, numbering, or explanations.
 Remember: HEADLINE IN RUSSIAN, link = <a href="URL">Источник</a>.
 """
 
-
-# ---------- Утилиты очистки ----------
 
 def _clean_unicode(text: str) -> str:
     if not text:
@@ -149,11 +144,6 @@ def _clean_unicode(text: str) -> str:
 
 
 def _normalize_source_link(text: str) -> str:
-    """
-    Приводит ссылку в конце поста к <a href="URL">Источник</a>.
-    Поддерживает и одинарные, и двойные кавычки, а также href=URL без кавычек.
-    """
-    # Универсальный regex для <a href=...>...</a>
     text = re.sub(
         r'<a\s+href\s*=\s*["\']?([^"\'\s>]+)["\']?[^>]*>[^<]*</a>',
         r'<a href="\1">Источник</a>',
@@ -165,9 +155,11 @@ def _normalize_source_link(text: str) -> str:
         if matches:
             last = matches[-1]
             url = last.group(0).rstrip(".,;:)")
-            before = text[:last.start()]
-            after = text[last.end():]
-            text = before + f'<a href="{url}">Источник</a>' + after
+            text = (
+                text[:last.start()]
+                + f'<a href="{url}">Источник</a>'
+                + text[last.end():]
+            )
     return text
 
 
@@ -201,10 +193,6 @@ def _cyrillic_ratio(text: str) -> float:
 
 
 def _headline_is_russian(text: str) -> tuple[bool, str, float]:
-    """
-    Проверяет, что заголовок в <b>...</b> на русском.
-    Возвращает (ok, headline_text, cyrillic_ratio).
-    """
     m = re.search(r'<b>(.+?)</b>', text, re.DOTALL)
     if not m:
         return False, "", 0.0
@@ -220,7 +208,6 @@ def _is_valid_post(text: str, max_len: int = 600) -> bool:
     if not stripped or not _is_emoji(stripped[0]):
         return False
 
-    # Заголовок в <b>...</b> должен быть на русском
     headline_ok, headline, ratio = _headline_is_russian(stripped)
     if not headline_ok:
         logger.warning(
@@ -234,7 +221,6 @@ def _is_valid_post(text: str, max_len: int = 600) -> bool:
     if "Источник" not in stripped:
         return False
 
-    # Общая проверка кириллицы
     if _cyrillic_ratio(stripped) < 0.40:
         logger.warning(
             "Пост отклонён: кириллицы %.0f%% (<40%%): %r",
@@ -272,8 +258,6 @@ def _parse_posts(raw: str) -> list[str]:
             )
     return posts
 
-
-# ---------- Запрос к одной модели ----------
 
 async def _try_model(
     model: str,
@@ -327,13 +311,10 @@ async def _try_model(
     return content
 
 
-# ---------- Публичная функция ----------
-
 async def summarize_news(articles: list[dict]) -> list[str]:
     if not articles:
         return []
 
-    # Явно маркируем исходный title как «на английском, нужно перевести»
     news_text = "\n\n".join(
         f"ИСХОДНАЯ НОВОСТЬ (перевести на русский, заголовок тоже!):\n"
         f"  Оригинальный заголовок: {a['title']}\n"
