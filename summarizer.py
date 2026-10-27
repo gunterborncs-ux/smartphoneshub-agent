@@ -74,6 +74,8 @@ IGNORE (do not create posts for):
 - Android Auto, CarPlay, automotive
 - TVs, consoles, games
 - Software (unless directly about a smartphone feature)
+- INSTRUCTIONS / HOW-TO GUIDES (e.g. "How to reset...", "How to unlock...")
+- PC HARDWARE / COMPONENTS (GPUs, CPUs, RAM, SSDs, graphics cards)
 
 If fewer than 3 items match the topic, produce as many as you can.
 NEVER pad the list with off-topic news.
