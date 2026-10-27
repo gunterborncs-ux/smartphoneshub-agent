@@ -1,10 +1,11 @@
 """
-Smartphones News Agent.
+Smartphones News Agent с обходом Cloudflare через impit.
 
 Логика фото:
-  1. Скачиваем картинку сами (HTML og:image или RSS-медиа, с Referer: article_url)
-  2. Если не удалось — placeholder
-  3. Если и placeholder не зашёл — текст
+  1. impit скачивает HTML статьи (имитация Chrome) → og:image
+  2. impit скачивает байты картинки
+  3. fallback: RSS-медиа
+  4. fallback: placeholder
 """
 import asyncio
 import json
@@ -13,8 +14,8 @@ import re
 import traceback
 from urllib.parse import quote, urljoin, urlparse
 
-import aiohttp
 import feedparser
+import impit
 from aiogram import Bot
 from aiogram.types import BufferedInputFile
 from bs4 import BeautifulSoup
@@ -50,12 +51,6 @@ _HREF_RE = re.compile(
     re.IGNORECASE,
 )
 
-_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
 _JUNK_MARKERS = (
     "/pixel", "1x1", "spacer", "tracking", "beacon",
     "favicon", "/icon/", "avatar", "logo.svg", "/emoji/",
@@ -63,6 +58,9 @@ _JUNK_MARKERS = (
 
 _MAX_IMAGE_BYTES = 9 * 1024 * 1024
 _MIN_IMAGE_BYTES = 1024
+
+# Таймауты для impit (в секундах)
+_IMPIT_TIMEOUT = 30
 
 
 def _html_escape(s: str) -> str:
@@ -125,15 +123,15 @@ def _make_placeholder(title: str) -> str:
     return PLACEHOLDER_IMAGE_TEMPLATE.format(text=quote(text))
 
 
-# ---------- Скачивание изображения на нашей стороне ----------
+# ---------- Скачивание через impit ----------
 
 async def _download_image_bytes(
-    session: aiohttp.ClientSession,
+    client: impit.AsyncClient,
     image_url: str,
     referer: str = "",
 ) -> bytes | None:
+    """Скачивает изображение через impit (имитация Chrome)."""
     headers = {
-        "User-Agent": _UA,
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "Accept-Language": "ru,en;q=0.5",
     }
@@ -141,95 +139,79 @@ async def _download_image_bytes(
         headers["Referer"] = referer
 
     try:
-        async with session.get(
-            image_url,
-            timeout=aiohttp.ClientTimeout(total=20),
-            headers=headers,
-        ) as resp:
-            if resp.status != 200:
-                logger.warning(
-                    "[IMG-DL] %s → HTTP %s", image_url[:100], resp.status,
-                )
-                return None
-            data = await resp.read()
-            if len(data) < _MIN_IMAGE_BYTES:
-                logger.warning(
-                    "[IMG-DL] %s → слишком маленький (%d байт)",
-                    image_url[:100], len(data),
-                )
-                return None
-            if len(data) > _MAX_IMAGE_BYTES:
-                logger.warning(
-                    "[IMG-DL] %s → слишком большой (%d МБ)",
-                    image_url[:100], len(data) // 1024 // 1024,
-                )
-                return None
-            logger.info(
-                "[IMG-DL] %s → OK, %d КБ",
-                image_url[:100], len(data) // 1024,
+        resp = await client.get(image_url, headers=headers, timeout=_IMPIT_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning(
+                "[IMG-DL] %s → HTTP %s", image_url[:100], resp.status_code,
             )
-            return data
+            return None
+        data = resp.content
+        if len(data) < _MIN_IMAGE_BYTES:
+            logger.warning(
+                "[IMG-DL] %s → слишком маленький (%d байт)",
+                image_url[:100], len(data),
+            )
+            return None
+        if len(data) > _MAX_IMAGE_BYTES:
+            logger.warning(
+                "[IMG-DL] %s → слишком большой (%d МБ)",
+                image_url[:100], len(data) // 1024 // 1024,
+            )
+            return None
+        logger.info(
+            "[IMG-DL] %s → OK, %d КБ",
+            image_url[:100], len(data) // 1024,
+        )
+        return data
     except Exception as exc:
         logger.warning("[IMG-DL] %s → %s", image_url[:100], exc)
         return None
 
 
 async def _try_download_first(
-    session: aiohttp.ClientSession,
+    client: impit.AsyncClient,
     urls: list[str],
     referer: str = "",
 ) -> bytes | None:
     for url in urls:
-        data = await _download_image_bytes(session, url, referer)
+        data = await _download_image_bytes(client, url, referer)
         if data:
             return data
     return None
 
 
-# ---------- HTML ----------
+# ---------- HTML через impit ----------
 
 async def _try_fetch_html(
-    session: aiohttp.ClientSession, url: str,
+    client: impit.AsyncClient, url: str,
 ) -> str | None:
+    """Загружает HTML через impit с имитацией Chrome."""
     variants = [url]
     if "://www." in url:
         variants.append(url.replace("://www.", "://"))
     if url.startswith("http://"):
         variants.append(url.replace("http://", "https://", 1))
 
-    headers_sets = [
-        {
-            "User-Agent": _UA,
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "ru,en;q=0.5",
-        },
-        {
-            "User-Agent": _UA,
-            "Accept": "*/*",
-            "Accept-Language": "ru",
-            "Referer": "https://yandex.ru/",
-        },
-    ]
+    headers = {
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "ru,en;q=0.5",
+    }
 
     for variant in variants:
-        for headers in headers_sets:
-            try:
-                async with session.get(
-                    variant, timeout=aiohttp.ClientTimeout(total=12),
-                    headers=headers,
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.text(errors="ignore")
-                    logger.warning("[HTML] %s → HTTP %s", variant, resp.status)
-            except Exception as exc:
-                logger.warning("[HTML] %s → %s", variant, exc)
+        try:
+            resp = await client.get(variant, headers=headers, timeout=_IMPIT_TIMEOUT)
+            if resp.status_code == 200:
+                return resp.text
+            logger.warning("[HTML] %s → HTTP %s", variant, resp.status_code)
+        except Exception as exc:
+            logger.warning("[HTML] %s → %s", variant, exc)
     return None
 
 
 async def fetch_article_image_url(
-    session: aiohttp.ClientSession, url: str,
+    client: impit.AsyncClient, url: str,
 ) -> str | None:
-    html = await _try_fetch_html(session, url)
+    html = await _try_fetch_html(client, url)
     if not html:
         return None
 
@@ -315,7 +297,7 @@ async def fetch_article_image_url(
     return None
 
 
-# ---------- RSS ----------
+# ---------- RSS (без изменений, через aiohttp или impit) ----------
 
 def _extract_rss_images(entry: dict, base_url: str) -> list[str]:
     images: list[str] = []
@@ -338,7 +320,6 @@ def _extract_rss_images(entry: dict, base_url: str) -> list[str]:
         seen.add(url)
         images.append(url)
 
-    # Все возможные поля RSS, где могут быть картинки
     for mc in (entry.get("media_content") or []):
         _add(mc.get("url", ""))
     for mt in (entry.get("media_thumbnail") or []):
@@ -346,13 +327,10 @@ def _extract_rss_images(entry: dict, base_url: str) -> list[str]:
     for enc in (entry.get("enclosures") or []):
         _add(enc.get("href") or enc.get("url", ""))
 
-    # HTML в summary / description
-    for key in ("summary", "description"):
-        text = entry.get(key, "") or ""
-        for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', text):
-            _add(m.group(1))
+    summary = entry.get("summary", "") or ""
+    for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', summary):
+        _add(m.group(1))
 
-    # HTML в content:encoded (feedparser кладёт в entry.content)
     content = entry.get("content", "")
     if isinstance(content, list):
         for c in content:
@@ -364,37 +342,32 @@ def _extract_rss_images(entry: dict, base_url: str) -> list[str]:
     return images
 
 
-async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
+async def fetch_rss(client: impit.AsyncClient, url: str) -> list[dict]:
+    """RSS тоже качаем через impit — на случай, если лента за Cloudflare."""
     try:
-        async with session.get(
+        resp = await client.get(
             url,
-            timeout=aiohttp.ClientTimeout(total=20),
             headers={
-                "User-Agent": _UA,
                 "Accept": "application/rss+xml,application/xml,text/xml,*/*",
             },
-        ) as resp:
-            raw = await resp.read()
-        feed = feedparser.parse(raw)
+            timeout=_IMPIT_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logger.warning("RSS %s → HTTP %s", url, resp.status_code)
+            return []
+        feed = feedparser.parse(resp.content)
         articles: list[dict] = []
         for entry in feed.entries[:15]:
             title = (entry.get("title") or "").strip()
             link = (entry.get("link") or "").strip()
             if not title or not link:
                 continue
-            images = _extract_rss_images(entry, link)
             articles.append({
                 "title": title,
                 "link": link,
                 "summary": (entry.get("summary") or "").strip(),
-                "rss_images": images,
+                "rss_images": _extract_rss_images(entry, link),
             })
-            # Диагностика для проблемных источников (например, 4pda)
-            if "4pda" in url and len(articles) <= 2:
-                logger.info(
-                    "[RSS-DEBUG] %s | title=%r | images=%d | keys=%s",
-                    url, title[:60], len(images), list(entry.keys()),
-                )
         logger.info(
             "RSS %s → %d статей (с фото: %d)",
             url, len(articles),
@@ -417,10 +390,9 @@ def is_relevant(article: dict) -> bool:
     return False
 
 
-async def collect_all_news() -> list[dict]:
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_rss(session, url) for url in RSS_FEEDS]
-        results = await asyncio.gather(*tasks)
+async def collect_all_news(client: impit.AsyncClient) -> list[dict]:
+    tasks = [fetch_rss(client, url) for url in RSS_FEEDS]
+    results = await asyncio.gather(*tasks)
 
     all_articles = [a for feed in results for a in feed]
     relevant = [a for a in all_articles if is_relevant(a)]
@@ -521,51 +493,48 @@ async def _send_single_post(
 
 
 async def publish_posts(
-    bot: Bot, posts: list[str], articles: list[dict],
+    client: impit.AsyncClient, bot: Bot, posts: list[str], articles: list[dict],
 ) -> list[str]:
     published: list[str] = []
-    async with aiohttp.ClientSession() as session:
-        for post in posts:
-            article = _match_article(post, articles)
-            title = article.get("title", "") if article else post[:50]
-            referer = article.get("link", "") if article else ""
-            image_bytes: bytes | None = None
-            source = "none"
+    for post in posts:
+        article = _match_article(post, articles)
+        title = article.get("title", "") if article else post[:50]
+        referer = article.get("link", "") if article else ""
+        image_bytes: bytes | None = None
+        source = "none"
 
-            if article:
-                html_url = await fetch_article_image_url(
-                    session, article["link"],
-                )
-                candidates: list[str] = []
-                if html_url:
-                    candidates.append(html_url)
-                if USE_RSS_MEDIA_FALLBACK:
-                    candidates.extend(article.get("rss_images", [])[:5])
-
-                logger.info(
-                    "[MEDIA] кандидатов фото: %d (HTML: %s, RSS: %d)",
-                    len(candidates),
-                    "да" if html_url else "нет",
-                    len(article.get("rss_images", [])),
-                )
-
-                image_bytes = await _try_download_first(
-                    session, candidates, referer,
-                )
-                if image_bytes:
-                    source = "bytes"
-            else:
-                logger.warning("[MEDIA] статья не сопоставлена")
+        if article:
+            html_url = await fetch_article_image_url(client, article["link"])
+            candidates: list[str] = []
+            if html_url:
+                candidates.append(html_url)
+            if USE_RSS_MEDIA_FALLBACK:
+                candidates.extend(article.get("rss_images", [])[:5])
 
             logger.info(
-                "[MEDIA] итог: source=%s, bytes=%s",
-                source,
-                f"{len(image_bytes) // 1024} КБ" if image_bytes else "None",
+                "[MEDIA] кандидатов фото: %d (HTML: %s, RSS: %d)",
+                len(candidates),
+                "да" if html_url else "нет",
+                len(article.get("rss_images", [])),
             )
 
-            if await _send_single_post(bot, post, image_bytes, title):
-                published.append(post)
-                await asyncio.sleep(POST_DELAY_SECONDS)
+            image_bytes = await _try_download_first(
+                client, candidates, referer,
+            )
+            if image_bytes:
+                source = "bytes"
+        else:
+            logger.warning("[MEDIA] статья не сопоставлена")
+
+        logger.info(
+            "[MEDIA] итог: source=%s, bytes=%s",
+            source,
+            f"{len(image_bytes) // 1024} КБ" if image_bytes else "None",
+        )
+
+        if await _send_single_post(bot, post, image_bytes, title):
+            published.append(post)
+            await asyncio.sleep(POST_DELAY_SECONDS)
     return published
 
 
@@ -580,62 +549,65 @@ def extract_urls(posts: list[str]) -> set[str]:
 async def run_cycle() -> None:
     logger.info("=== Старт цикла ===")
     bot = Bot(token=BOT_TOKEN)
-    try:
-        articles = await collect_all_news()
-        if not articles:
-            logger.warning("Нет релевантных статей")
-            await notify_admin(bot, "🚨 <b>Не собрано релевантных статей</b>")
-            return
 
-        articles = articles[:MAX_ARTICLES_PER_RUN]
-        history = load_history(HISTORY_FILE)
-        articles = filter_unpublished(articles, history)
-        logger.info("После фильтра по истории: %d", len(articles))
+    # impit: имитация Chrome для обхода Cloudflare
+    async with impit.AsyncClient(browser="chrome", http3=True) as client:
+        try:
+            articles = await collect_all_news(client)
+            if not articles:
+                logger.warning("Нет релевантных статей")
+                await notify_admin(bot, "🚨 <b>Не собрано релевантных статей</b>")
+                return
 
-        if not articles:
-            logger.info("Все статьи уже опубликованы")
-            return
+            articles = articles[:MAX_ARTICLES_PER_RUN]
+            history = load_history(HISTORY_FILE)
+            articles = filter_unpublished(articles, history)
+            logger.info("После фильтра по истории: %d", len(articles))
 
-        articles = deduplicate(articles, threshold=SIMILARITY_THRESHOLD)
-        logger.info("После дедупликации: %d", len(articles))
-        if not articles:
-            return
+            if not articles:
+                logger.info("Все статьи уже опубликованы")
+                return
 
-        posts = await summarize_news(articles)
-        logger.info("Сгенерировано постов: %d", len(posts))
+            articles = deduplicate(articles, threshold=SIMILARITY_THRESHOLD)
+            logger.info("После дедупликации: %d", len(articles))
+            if not articles:
+                return
 
-        clean_posts = [
-            p for p in posts
-            if not any(m in p.lower() for m in _LEAK_MARKERS)
-        ]
-        posts = clean_posts[:MAX_POSTS_PER_RUN]
+            posts = await summarize_news(articles)
+            logger.info("Сгенерировано постов: %d", len(posts))
 
-        if not posts:
-            logger.error("Нет валидных постов")
-            await notify_admin(
-                bot, "🚨 <b>LLM не сгенерировала валидных постов</b>",
-                f"Статей на входе: {len(articles)}",
-            )
-            return
+            clean_posts = [
+                p for p in posts
+                if not any(m in p.lower() for m in _LEAK_MARKERS)
+            ]
+            posts = clean_posts[:MAX_POSTS_PER_RUN]
 
-        published = await publish_posts(bot, posts, articles)
-        if not published:
-            await notify_admin(bot, "🚨 <b>Ни один пост не опубликован</b>")
-            return
+            if not posts:
+                logger.error("Нет валидных постов")
+                await notify_admin(
+                    bot, "🚨 <b>LLM не сгенерировала валидных постов</b>",
+                    f"Статей на входе: {len(articles)}",
+                )
+                return
 
-        new_urls = extract_urls(published)
-        add_urls(history, new_urls)
-        history = cleanup_old(history, days=HISTORY_RETENTION_DAYS)
-        save_history(HISTORY_FILE, history)
+            published = await publish_posts(client, bot, posts, articles)
+            if not published:
+                await notify_admin(bot, "🚨 <b>Ни один пост не опубликован</b>")
+                return
 
-        logger.info("=== Цикл завершён: опубликовано %d ===", len(published))
+            new_urls = extract_urls(published)
+            add_urls(history, new_urls)
+            history = cleanup_old(history, days=HISTORY_RETENTION_DAYS)
+            save_history(HISTORY_FILE, history)
 
-    except Exception as exc:
-        tb = traceback.format_exc()
-        logger.error("Необработанное исключение: %s", exc, exc_info=True)
-        await notify_admin(bot, "🚨 <b>Необработанное исключение</b>", tb)
-    finally:
-        await bot.session.close()
+            logger.info("=== Цикл завершён: опубликовано %d ===", len(published))
+
+        except Exception as exc:
+            tb = traceback.format_exc()
+            logger.error("Необработанное исключение: %s", exc, exc_info=True)
+            await notify_admin(bot, "🚨 <b>Необработанное исключение</b>", tb)
+        finally:
+            await bot.session.close()
 
 
 def main() -> None:
