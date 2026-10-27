@@ -2,11 +2,9 @@
 Smartphones News Agent.
 
 Логика фото:
-  1. Скачиваем картинку сами (HTML og:image, с Referer: article_url) —
-     обходим CDN, которые блокируют серверы Telegram
-  2. При ошибке — пробуем RSS-медиа
-  3. Если ничего — placeholder
-  4. Если и placeholder не зашёл — текст
+  1. Скачиваем картинку сами (HTML og:image или RSS-медиа, с Referer: article_url)
+  2. Если не удалось — placeholder
+  3. Если и placeholder не зашёл — текст
 """
 import asyncio
 import json
@@ -63,7 +61,6 @@ _JUNK_MARKERS = (
     "favicon", "/icon/", "avatar", "logo.svg", "/emoji/",
 )
 
-# Telegram не примет фото больше 10 МБ при upload
 _MAX_IMAGE_BYTES = 9 * 1024 * 1024
 _MIN_IMAGE_BYTES = 1024
 
@@ -135,10 +132,6 @@ async def _download_image_bytes(
     image_url: str,
     referer: str = "",
 ) -> bytes | None:
-    """
-    Скачивает изображение с правильным Referer.
-    Обходит CDN, которые блокируют серверы Telegram.
-    """
     headers = {
         "User-Agent": _UA,
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
@@ -186,7 +179,6 @@ async def _try_download_first(
     urls: list[str],
     referer: str = "",
 ) -> bytes | None:
-    """Пробует скачать по списку URL, возвращает первые байты."""
     for url in urls:
         data = await _download_image_bytes(session, url, referer)
         if data:
@@ -194,7 +186,7 @@ async def _try_download_first(
     return None
 
 
-# ---------- HTML: og:image URL (только извлечение, не отправка) ----------
+# ---------- HTML ----------
 
 async def _try_fetch_html(
     session: aiohttp.ClientSession, url: str,
@@ -237,7 +229,6 @@ async def _try_fetch_html(
 async def fetch_article_image_url(
     session: aiohttp.ClientSession, url: str,
 ) -> str | None:
-    """Возвращает URL картинки-кандидата (не байты)."""
     html = await _try_fetch_html(session, url)
     if not html:
         return None
@@ -347,6 +338,7 @@ def _extract_rss_images(entry: dict, base_url: str) -> list[str]:
         seen.add(url)
         images.append(url)
 
+    # Все возможные поля RSS, где могут быть картинки
     for mc in (entry.get("media_content") or []):
         _add(mc.get("url", ""))
     for mt in (entry.get("media_thumbnail") or []):
@@ -354,10 +346,13 @@ def _extract_rss_images(entry: dict, base_url: str) -> list[str]:
     for enc in (entry.get("enclosures") or []):
         _add(enc.get("href") or enc.get("url", ""))
 
-    summary = entry.get("summary", "") or ""
-    for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', summary):
-        _add(m.group(1))
+    # HTML в summary / description
+    for key in ("summary", "description"):
+        text = entry.get(key, "") or ""
+        for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', text):
+            _add(m.group(1))
 
+    # HTML в content:encoded (feedparser кладёт в entry.content)
     content = entry.get("content", "")
     if isinstance(content, list):
         for c in content:
@@ -387,12 +382,19 @@ async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
             link = (entry.get("link") or "").strip()
             if not title or not link:
                 continue
+            images = _extract_rss_images(entry, link)
             articles.append({
                 "title": title,
                 "link": link,
                 "summary": (entry.get("summary") or "").strip(),
-                "rss_images": _extract_rss_images(entry, link),
+                "rss_images": images,
             })
+            # Диагностика для проблемных источников (например, 4pda)
+            if "4pda" in url and len(articles) <= 2:
+                logger.info(
+                    "[RSS-DEBUG] %s | title=%r | images=%d | keys=%s",
+                    url, title[:60], len(images), list(entry.keys()),
+                )
         logger.info(
             "RSS %s → %d статей (с фото: %d)",
             url, len(articles),
@@ -482,7 +484,6 @@ async def notify_admin(bot: Bot, reason: str, details: str = "") -> None:
 async def _send_single_post(
     bot: Bot, post: str, image_bytes: bytes | None, title: str,
 ) -> bool:
-    """Отправка: bytes → placeholder → текст."""
     if image_bytes:
         try:
             photo = BufferedInputFile(image_bytes, filename="photo.jpg")
@@ -522,12 +523,6 @@ async def _send_single_post(
 async def publish_posts(
     bot: Bot, posts: list[str], articles: list[dict],
 ) -> list[str]:
-    """
-    Логика фото:
-      1. og:image из HTML → скачиваем байты (с Referer: article_url)
-      2. Если не удалось — RSS-медиа → тоже скачиваем байты
-      3. Если совсем ничего — placeholder → текст
-    """
     published: list[str] = []
     async with aiohttp.ClientSession() as session:
         for post in posts:
@@ -538,7 +533,6 @@ async def publish_posts(
             source = "none"
 
             if article:
-                # Шаг 1: og:image из HTML, RSS — как backup
                 html_url = await fetch_article_image_url(
                     session, article["link"],
                 )
