@@ -1,23 +1,18 @@
 """
-Smartphones News Agent с обходом Cloudflare через impit.
-
-Логика фото:
-  1. impit скачивает HTML статьи (имитация Chrome) → og:image
-  2. impit скачивает байты картинки
-  3. fallback: RSS-медиа
-  4. fallback: placeholder
+Smartphones News Agent.
+Медиа (фото/видео) берётся ТОЛЬКО из RSS.
+Никаких HTML-запросов, impit и плейсхолдеров.
 """
 import asyncio
-import json
 import logging
 import re
 import traceback
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
+import aiohttp
 import feedparser
-import impit
 from aiogram import Bot
-from aiogram.types import BufferedInputFile
+from aiogram.types import InputMediaPhoto
 from bs4 import BeautifulSoup
 
 from config import (
@@ -25,8 +20,6 @@ from config import (
     MAX_ARTICLES_PER_RUN, MAX_POSTS_PER_RUN,
     SIMILARITY_THRESHOLD, HISTORY_FILE,
     POST_DELAY_SECONDS, HISTORY_RETENTION_DAYS,
-    USE_RSS_MEDIA_FALLBACK, USE_PLACEHOLDER_IF_NO_PHOTO,
-    PLACEHOLDER_IMAGE_TEMPLATE,
 )
 from dedup import deduplicate
 from rss_sources import RSS_FEEDS, BRAND_MARKERS, PHONE_KEYWORDS, STOP_WORDS
@@ -51,16 +44,18 @@ _HREF_RE = re.compile(
     re.IGNORECASE,
 )
 
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
 _JUNK_MARKERS = (
     "/pixel", "1x1", "spacer", "tracking", "beacon",
     "favicon", "/icon/", "avatar", "logo.svg", "/emoji/",
 )
 
-_MAX_IMAGE_BYTES = 9 * 1024 * 1024
-_MIN_IMAGE_BYTES = 1024
-
-# Таймауты для impit (в секундах)
-_IMPIT_TIMEOUT = 30
+_MAX_PHOTOS_PER_POST = 10
 
 
 def _html_escape(s: str) -> str:
@@ -111,199 +106,18 @@ def _url_fingerprint(url: str) -> str:
     return f"{netloc}/{segments[-1].split('.')[0]}"
 
 
-def _make_placeholder(title: str) -> str:
-    title_lower = title.lower()
-    text = None
-    for brand in BRAND_MARKERS:
-        if brand in title_lower:
-            text = brand.upper()
-            break
-    if not text:
-        text = title[:25].strip() or "PHONE"
-    return PLACEHOLDER_IMAGE_TEMPLATE.format(text=quote(text))
+# ---------- Извлечение медиа из RSS ----------
 
-
-# ---------- Скачивание через impit ----------
-
-async def _download_image_bytes(
-    client: impit.AsyncClient,
-    image_url: str,
-    referer: str = "",
-) -> bytes | None:
-    """Скачивает изображение через impit (имитация Chrome)."""
-    headers = {
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Accept-Language": "ru,en;q=0.5",
-    }
-    if referer:
-        headers["Referer"] = referer
-
-    try:
-        resp = await client.get(image_url, headers=headers, timeout=_IMPIT_TIMEOUT)
-        if resp.status_code != 200:
-            logger.warning(
-                "[IMG-DL] %s → HTTP %s", image_url[:100], resp.status_code,
-            )
-            return None
-        data = resp.content
-        if len(data) < _MIN_IMAGE_BYTES:
-            logger.warning(
-                "[IMG-DL] %s → слишком маленький (%d байт)",
-                image_url[:100], len(data),
-            )
-            return None
-        if len(data) > _MAX_IMAGE_BYTES:
-            logger.warning(
-                "[IMG-DL] %s → слишком большой (%d МБ)",
-                image_url[:100], len(data) // 1024 // 1024,
-            )
-            return None
-        logger.info(
-            "[IMG-DL] %s → OK, %d КБ",
-            image_url[:100], len(data) // 1024,
-        )
-        return data
-    except Exception as exc:
-        logger.warning("[IMG-DL] %s → %s", image_url[:100], exc)
-        return None
-
-
-async def _try_download_first(
-    client: impit.AsyncClient,
-    urls: list[str],
-    referer: str = "",
-) -> bytes | None:
-    for url in urls:
-        data = await _download_image_bytes(client, url, referer)
-        if data:
-            return data
-    return None
-
-
-# ---------- HTML через impit ----------
-
-async def _try_fetch_html(
-    client: impit.AsyncClient, url: str,
-) -> str | None:
-    """Загружает HTML через impit с имитацией Chrome."""
-    variants = [url]
-    if "://www." in url:
-        variants.append(url.replace("://www.", "://"))
-    if url.startswith("http://"):
-        variants.append(url.replace("http://", "https://", 1))
-
-    headers = {
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "ru,en;q=0.5",
-    }
-
-    for variant in variants:
-        try:
-            resp = await client.get(variant, headers=headers, timeout=_IMPIT_TIMEOUT)
-            if resp.status_code == 200:
-                return resp.text
-            logger.warning("[HTML] %s → HTTP %s", variant, resp.status_code)
-        except Exception as exc:
-            logger.warning("[HTML] %s → %s", variant, exc)
-    return None
-
-
-async def fetch_article_image_url(
-    client: impit.AsyncClient, url: str,
-) -> str | None:
-    html = await _try_fetch_html(client, url)
-    if not html:
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    for tag in soup.find_all("meta"):
-        prop = (tag.get("property") or tag.get("name") or "").lower()
-        if prop in ("og:image", "og:image:url", "og:image:secure_url"):
-            c = tag.get("content", "").strip()
-            if c:
-                u = urljoin(url, c)
-                if _is_valid_image_url(u):
-                    logger.info("[HTML] %s → og:image", url)
-                    return u
-
-    for tag in soup.find_all("meta"):
-        prop = (tag.get("property") or tag.get("name") or "").lower()
-        if prop in ("twitter:image", "twitter:image:src"):
-            c = tag.get("content", "").strip()
-            if c:
-                u = urljoin(url, c)
-                if _is_valid_image_url(u):
-                    logger.info("[HTML] %s → twitter:image", url)
-                    return u
-
-    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        try:
-            data = json.loads(script.string or "")
-        except Exception:
-            continue
-        items = data if isinstance(data, list) else [data]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            img = item.get("image")
-            cands: list[str] = []
-            if isinstance(img, str):
-                cands = [img]
-            elif isinstance(img, list):
-                for x in img:
-                    if isinstance(x, str):
-                        cands.append(x)
-                    elif isinstance(x, dict) and x.get("url"):
-                        cands.append(x["url"])
-            elif isinstance(img, dict) and img.get("url"):
-                cands = [img["url"]]
-            for c in cands:
-                u = urljoin(url, c.strip())
-                if _is_valid_image_url(u):
-                    logger.info("[HTML] %s → JSON-LD", url)
-                    return u
-
-    for container in (soup.find_all("article") or soup.find_all("main") or []):
-        for img in container.find_all("img"):
-            w, h = img.get("width"), img.get("height")
-            try:
-                if w and int(w) < 300:
-                    continue
-                if h and int(h) < 200:
-                    continue
-            except (ValueError, TypeError):
-                pass
-            src = (
-                img.get("src")
-                or img.get("data-src")
-                or img.get("data-original")
-                or img.get("data-lazy-src")
-            )
-            if not src:
-                srcset = img.get("srcset") or img.get("data-srcset") or ""
-                if srcset:
-                    parts = [p.strip().split(" ") for p in srcset.split(",") if p.strip()]
-                    if parts:
-                        src = parts[-1][0]
-            if not src:
-                continue
-            u = urljoin(url, src.strip())
-            if _is_valid_image_url(u):
-                logger.info("[HTML] %s → <img>", url)
-                return u
-
-    logger.warning("[HTML] %s → фото не найдено", url)
-    return None
-
-
-# ---------- RSS (без изменений, через aiohttp или impit) ----------
-
-def _extract_rss_images(entry: dict, base_url: str) -> list[str]:
+def _extract_rss_media(entry: dict, base_url: str) -> tuple[list[str], str | None]:
+    """
+    Собирает уникальные фото и видео из полей RSS:
+    media_content, media_thumbnail, enclosures, <img> в summary/content.
+    """
     images: list[str] = []
     seen: set[str] = set()
+    video: str | None = None
 
-    def _add(url: str) -> None:
+    def _add_image(url: str) -> None:
         if not url or not isinstance(url, str):
             return
         url = url.strip()
@@ -320,58 +134,92 @@ def _extract_rss_images(entry: dict, base_url: str) -> list[str]:
         seen.add(url)
         images.append(url)
 
-    for mc in (entry.get("media_content") or []):
-        _add(mc.get("url", ""))
-    for mt in (entry.get("media_thumbnail") or []):
-        _add(mt.get("url", ""))
-    for enc in (entry.get("enclosures") or []):
-        _add(enc.get("href") or enc.get("url", ""))
+    def _set_video(url: str) -> None:
+        nonlocal video
+        if video or not url or not isinstance(url, str):
+            return
+        url = url.strip()
+        if not url:
+            return
+        if url.startswith("//"):
+            url = "https:" + url
+        elif not (url.startswith("http://") or url.startswith("https://")):
+            url = urljoin(base_url, url)
+        video = url
 
+    # media_content
+    for mc in (entry.get("media_content") or []):
+        url = mc.get("url", "")
+        mtype = mc.get("type", "")
+        if url and mtype.startswith("video/") and not video:
+            _set_video(url)
+        elif url and mtype.startswith("image/"):
+            _add_image(url)
+
+    # media_thumbnail
+    for mt in (entry.get("media_thumbnail") or []):
+        _add_image(mt.get("url", ""))
+
+    # enclosures
+    for enc in (entry.get("enclosures") or []):
+        url = enc.get("href") or enc.get("url", "")
+        mtype = enc.get("type", "")
+        if url and mtype.startswith("video/") and not video:
+            _set_video(url)
+        elif url and mtype.startswith("image/"):
+            _add_image(url)
+
+    # <img> в summary
     summary = entry.get("summary", "") or ""
     for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', summary):
-        _add(m.group(1))
+        _add_image(m.group(1))
 
+    # <img> в content:encoded
     content = entry.get("content", "")
     if isinstance(content, list):
         for c in content:
             if isinstance(c, dict):
                 val = c.get("value", "") or ""
                 for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', val):
-                    _add(m.group(1))
+                    _add_image(m.group(1))
 
-    return images
+    return images[:_MAX_PHOTOS_PER_POST], video
 
 
-async def fetch_rss(client: impit.AsyncClient, url: str) -> list[dict]:
-    """RSS тоже качаем через impit — на случай, если лента за Cloudflare."""
+async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
     try:
-        resp = await client.get(
+        async with session.get(
             url,
+            timeout=aiohttp.ClientTimeout(total=20),
             headers={
+                "User-Agent": _UA,
                 "Accept": "application/rss+xml,application/xml,text/xml,*/*",
             },
-            timeout=_IMPIT_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            logger.warning("RSS %s → HTTP %s", url, resp.status_code)
-            return []
-        feed = feedparser.parse(resp.content)
+        ) as resp:
+            if resp.status != 200:
+                logger.warning("RSS %s → HTTP %s", url, resp.status)
+                return []
+            raw = await resp.read()
+        feed = feedparser.parse(raw)
         articles: list[dict] = []
         for entry in feed.entries[:15]:
             title = (entry.get("title") or "").strip()
             link = (entry.get("link") or "").strip()
             if not title or not link:
                 continue
+            images, video = _extract_rss_media(entry, link)
             articles.append({
                 "title": title,
                 "link": link,
                 "summary": (entry.get("summary") or "").strip(),
-                "rss_images": _extract_rss_images(entry, link),
+                "rss_images": images,
+                "rss_video": video,
             })
         logger.info(
-            "RSS %s → %d статей (с фото: %d)",
+            "RSS %s → %d статей (с фото: %d, с видео: %d)",
             url, len(articles),
             sum(1 for a in articles if a["rss_images"]),
+            sum(1 for a in articles if a.get("rss_video")),
         )
         return articles
     except Exception as exc:
@@ -390,16 +238,18 @@ def is_relevant(article: dict) -> bool:
     return False
 
 
-async def collect_all_news(client: impit.AsyncClient) -> list[dict]:
-    tasks = [fetch_rss(client, url) for url in RSS_FEEDS]
-    results = await asyncio.gather(*tasks)
+async def collect_all_news() -> list[dict]:
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_rss(session, url) for url in RSS_FEEDS]
+        results = await asyncio.gather(*tasks)
 
     all_articles = [a for feed in results for a in feed]
     relevant = [a for a in all_articles if is_relevant(a)]
     with_photo = sum(1 for a in relevant if a.get("rss_images"))
+    with_video = sum(1 for a in relevant if a.get("rss_video"))
     logger.info(
-        "Собрано: %d, релевантных: %d (с RSS-фото: %d)",
-        len(all_articles), len(relevant), with_photo,
+        "Собрано: %d, релевантных: %d (с фото: %d, с видео: %d)",
+        len(all_articles), len(relevant), with_photo, with_video,
     )
     return relevant
 
@@ -451,34 +301,54 @@ async def notify_admin(bot: Bot, reason: str, details: str = "") -> None:
         logger.error("Не удалось отправить уведомление: %s", exc)
 
 
-# ---------- Публикация ----------
+# ---------- Публикация (только RSS-медиа) ----------
 
 async def _send_single_post(
-    bot: Bot, post: str, image_bytes: bytes | None, title: str,
+    bot: Bot, post: str, images: list[str], video: str | None,
 ) -> bool:
-    if image_bytes:
+    """
+    Приоритет:
+      1. Видео (sendVideo) — фото игнорируются.
+      2. Альбом 2+ фото (sendMediaGroup).
+      3. Одно фото (sendPhoto).
+      4. Текст (sendMessage).
+    """
+    if video:
         try:
-            photo = BufferedInputFile(image_bytes, filename="photo.jpg")
-            await bot.send_photo(
-                chat_id=CHANNEL_ID, photo=photo,
-                caption=post, parse_mode="HTML",
+            await bot.send_video(
+                chat_id=CHANNEL_ID, video=video, caption=post, parse_mode="HTML",
             )
-            logger.info("[SEND] фото (bytes) OK: %s...", post[:60])
+            logger.info("[SEND] видео OK: %s...", post[:60])
             return True
         except Exception as exc:
-            logger.warning("[SEND] send_photo(bytes) упал: %s", exc)
+            logger.warning("[SEND] send_video упал: %s | URL: %s", exc, video[:120])
 
-    if USE_PLACEHOLDER_IF_NO_PHOTO:
-        placeholder = _make_placeholder(title)
+    photos = images[:_MAX_PHOTOS_PER_POST]
+    if len(photos) >= 2:
         try:
-            await bot.send_photo(
-                chat_id=CHANNEL_ID, photo=placeholder,
-                caption=post, parse_mode="HTML",
-            )
-            logger.info("[SEND] placeholder OK: %s...", post[:60])
+            media = [
+                InputMediaPhoto(
+                    media=url,
+                    caption=post if i == 0 else None,
+                    parse_mode="HTML" if i == 0 else None,
+                )
+                for i, url in enumerate(photos)
+            ]
+            await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+            logger.info("[SEND] альбом (%d фото): %s...", len(photos), post[:60])
             return True
         except Exception as exc:
-            logger.warning("[SEND] placeholder упал: %s", exc)
+            logger.warning("[SEND] альбом упал: %s", exc)
+
+    if photos:
+        try:
+            await bot.send_photo(
+                chat_id=CHANNEL_ID, photo=photos[0], caption=post, parse_mode="HTML",
+            )
+            logger.info("[SEND] фото OK: %s...", post[:60])
+            return True
+        except Exception as exc:
+            logger.warning("[SEND] send_photo упал: %s | URL: %s", exc, photos[0][:120])
 
     try:
         await bot.send_message(
@@ -493,46 +363,20 @@ async def _send_single_post(
 
 
 async def publish_posts(
-    client: impit.AsyncClient, bot: Bot, posts: list[str], articles: list[dict],
+    bot: Bot, posts: list[str], articles: list[dict],
 ) -> list[str]:
     published: list[str] = []
     for post in posts:
         article = _match_article(post, articles)
-        title = article.get("title", "") if article else post[:50]
-        referer = article.get("link", "") if article else ""
-        image_bytes: bytes | None = None
-        source = "none"
-
-        if article:
-            html_url = await fetch_article_image_url(client, article["link"])
-            candidates: list[str] = []
-            if html_url:
-                candidates.append(html_url)
-            if USE_RSS_MEDIA_FALLBACK:
-                candidates.extend(article.get("rss_images", [])[:5])
-
-            logger.info(
-                "[MEDIA] кандидатов фото: %d (HTML: %s, RSS: %d)",
-                len(candidates),
-                "да" if html_url else "нет",
-                len(article.get("rss_images", [])),
-            )
-
-            image_bytes = await _try_download_first(
-                client, candidates, referer,
-            )
-            if image_bytes:
-                source = "bytes"
-        else:
-            logger.warning("[MEDIA] статья не сопоставлена")
+        images = article.get("rss_images", []) if article else []
+        video = article.get("rss_video") if article else None
 
         logger.info(
-            "[MEDIA] итог: source=%s, bytes=%s",
-            source,
-            f"{len(image_bytes) // 1024} КБ" if image_bytes else "None",
+            "[MEDIA] RSS: фото=%d, видео=%s",
+            len(images), "да" if video else "нет",
         )
 
-        if await _send_single_post(bot, post, image_bytes, title):
+        if await _send_single_post(bot, post, images, video):
             published.append(post)
             await asyncio.sleep(POST_DELAY_SECONDS)
     return published
@@ -549,65 +393,62 @@ def extract_urls(posts: list[str]) -> set[str]:
 async def run_cycle() -> None:
     logger.info("=== Старт цикла ===")
     bot = Bot(token=BOT_TOKEN)
+    try:
+        articles = await collect_all_news()
+        if not articles:
+            logger.warning("Нет релевантных статей")
+            await notify_admin(bot, "🚨 <b>Не собрано релевантных статей</b>")
+            return
 
-    # impit: имитация Chrome для обхода Cloudflare
-    async with impit.AsyncClient(browser="chrome", http3=True) as client:
-        try:
-            articles = await collect_all_news(client)
-            if not articles:
-                logger.warning("Нет релевантных статей")
-                await notify_admin(bot, "🚨 <b>Не собрано релевантных статей</b>")
-                return
+        articles = articles[:MAX_ARTICLES_PER_RUN]
+        history = load_history(HISTORY_FILE)
+        articles = filter_unpublished(articles, history)
+        logger.info("После фильтра по истории: %d", len(articles))
 
-            articles = articles[:MAX_ARTICLES_PER_RUN]
-            history = load_history(HISTORY_FILE)
-            articles = filter_unpublished(articles, history)
-            logger.info("После фильтра по истории: %d", len(articles))
+        if not articles:
+            logger.info("Все статьи уже опубликованы")
+            return
 
-            if not articles:
-                logger.info("Все статьи уже опубликованы")
-                return
+        articles = deduplicate(articles, threshold=SIMILARITY_THRESHOLD)
+        logger.info("После дедупликации: %d", len(articles))
+        if not articles:
+            return
 
-            articles = deduplicate(articles, threshold=SIMILARITY_THRESHOLD)
-            logger.info("После дедупликации: %d", len(articles))
-            if not articles:
-                return
+        posts = await summarize_news(articles)
+        logger.info("Сгенерировано постов: %d", len(posts))
 
-            posts = await summarize_news(articles)
-            logger.info("Сгенерировано постов: %d", len(posts))
+        clean_posts = [
+            p for p in posts
+            if not any(m in p.lower() for m in _LEAK_MARKERS)
+        ]
+        posts = clean_posts[:MAX_POSTS_PER_RUN]
 
-            clean_posts = [
-                p for p in posts
-                if not any(m in p.lower() for m in _LEAK_MARKERS)
-            ]
-            posts = clean_posts[:MAX_POSTS_PER_RUN]
+        if not posts:
+            logger.error("Нет валидных постов")
+            await notify_admin(
+                bot, "🚨 <b>LLM не сгенерировала валидных постов</b>",
+                f"Статей на входе: {len(articles)}",
+            )
+            return
 
-            if not posts:
-                logger.error("Нет валидных постов")
-                await notify_admin(
-                    bot, "🚨 <b>LLM не сгенерировала валидных постов</b>",
-                    f"Статей на входе: {len(articles)}",
-                )
-                return
+        published = await publish_posts(bot, posts, articles)
+        if not published:
+            await notify_admin(bot, "🚨 <b>Ни один пост не опубликован</b>")
+            return
 
-            published = await publish_posts(client, bot, posts, articles)
-            if not published:
-                await notify_admin(bot, "🚨 <b>Ни один пост не опубликован</b>")
-                return
+        new_urls = extract_urls(published)
+        add_urls(history, new_urls)
+        history = cleanup_old(history, days=HISTORY_RETENTION_DAYS)
+        save_history(HISTORY_FILE, history)
 
-            new_urls = extract_urls(published)
-            add_urls(history, new_urls)
-            history = cleanup_old(history, days=HISTORY_RETENTION_DAYS)
-            save_history(HISTORY_FILE, history)
+        logger.info("=== Цикл завершён: опубликовано %d ===", len(published))
 
-            logger.info("=== Цикл завершён: опубликовано %d ===", len(published))
-
-        except Exception as exc:
-            tb = traceback.format_exc()
-            logger.error("Необработанное исключение: %s", exc, exc_info=True)
-            await notify_admin(bot, "🚨 <b>Необработанное исключение</b>", tb)
-        finally:
-            await bot.session.close()
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error("Необработанное исключение: %s", exc, exc_info=True)
+        await notify_admin(bot, "🚨 <b>Необработанное исключение</b>", tb)
+    finally:
+        await bot.session.close()
 
 
 def main() -> None:
