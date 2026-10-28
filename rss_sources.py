@@ -1,19 +1,22 @@
 """
 Источники RSS и правила фильтрации для смартфонов.
-Только российские сайты.
+Только крупные мировые издания с надёжными RSS-лентами.
 """
 
 RSS_FEEDS = [
-    "https://www.ixbt.com/export/news/rss.xml",
+    # --- Англоязычные ---
+    "https://www.gsmarena.com/rss-news-reviews.php",
+    "https://www.theverge.com/rss/index.xml",
+    "https://techcrunch.com/category/mobile/feed/",
+    "https://www.androidauthority.com/feed/",
+    "https://9to5google.com/feed/",
+    "https://www.phonearena.com/news/rss",
+    "https://www.gizmochina.com/feed/",
+    "https://www.xda-developers.com/feed/",
+    # --- Русскоязычные ---
+    "https://www.ixbt.com/export/news.rss",
+    "https://mobile-review.com/feed/",
     "https://4pda.to/feed/",
-    "https://hi-news.ru/feed",
-    "https://3dnews.ru/news/rss/",
-    "https://mobile-review.com/rss/news.xml",
-    "https://www.ferra.ru/export/news.xml",
-    "https://androidinsider.ru/feed",
-    "https://rozetked.me/rss.xml",
-    "https://club.dns-shop.ru/rss/",
-    "https://wylsa.com/feed/",
 ]
 
 BRAND_MARKERS = [
@@ -104,15 +107,14 @@ STOP_WORDS = [
     # ТАРИФЫ
     "тариф", "tariff", "подписк", "subscription",
     "оператор связи", "carrier plan",
-    # ============ ИНСТРУКЦИИ / HOW-TO ============
-"как сбросить", "как разблокировать", "как настроить",
-"как восстановить", "как включить", "как выключить",
-"как перенести", "как очистить", "как ускорить",
-"инструкция", "пошагово", "how to", "guide",
-"заводских настроек", "заводские настройки",
-
-# ============ КОМПЛЕКТУЮЩИЕ ДЛЯ ПК ============
-"видеокарта", "gpu", "rtx", "geforce", "radeon",
-"материнская плата", "блок питания", "процессор для пк",
-"оперативная память", "ssd", "hdd", "кулер", "термопаста",
+    # ИНСТРУКЦИИ
+    "как сбросить", "как разблокировать", "как настроить",
+    "как восстановить", "как включить", "как выключить",
+    "как перенести", "как очистить", "как ускорить",
+    "инструкция", "пошагово", "how to", "guide",
+    "заводских настроек", "заводские настройки",
+    # ПК-ЖЕЛЕЗО
+    "видеокарта", "gpu", "rtx", "geforce", "radeon",
+    "материнская плата", "блок питания", "процессор для пк",
+    "оперативная память", "ssd", "hdd", "кулер", "термопаста",
 ]
