@@ -1,10 +1,7 @@
 """
 Суммаризация новостей о смартфонах через OpenRouter.
-
-Валидация:
-- Заголовок в <b>...</b> должен быть на русском (≥40% кириллицы)
-- Общий текст — тоже ≥40% кириллицы
-- Ссылка должна быть в <a href="URL">Источник</a>
+Формат: заголовок <b>, текст, ссылка <a href="URL">Источник</a>.
+Жёсткая языковая валидация: кириллицы >= 40%.
 """
 import logging
 import re
@@ -38,7 +35,7 @@ RULE 1. OUTPUT LANGUAGE: RUSSIAN ONLY.
 
 RULE 2. HEADLINE MUST BE IN RUSSIAN.
 - The <b>...</b> headline MUST be translated to Russian.
-- DO NOT copy the source title verbatim into the headline.
+- DO NOT copy the source title verbatim.
 - A post with an English headline will be automatically REJECTED.
 
 ═══════════════════════════════════════════════════════════
